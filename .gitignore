@@ -1,0 +1,3 @@
+*_segmentations/
+__pycache__/
+*.pyc
