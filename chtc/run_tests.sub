@@ -56,9 +56,10 @@ when_to_transfer_output = ON_EXIT
 # Inputs: only the scripts; the SIF is referenced by container_image, not transferred here.
 transfer_input_files = test_on_chtc.py, segmentation_pipeline.py, chtc/run_tests.sh
 
-# Outputs: HTCondor automatically transfers everything created in the job's
-# working directory, except large bind-mounted paths. We rely on that default
-# so test_output/, test_results.json, and any logs come back.
+# Outputs: HTCondor's default only catches top-level files (not subdirs), so we
+# explicitly list test_output/ to get the segmentation results back. We do NOT
+# transfer hf_cache/ — it's a ~3GB throwaway model cache.
+transfer_output_files = test_results.json, test_output
 
 # ============================================================================
 # Log files — analyze_results.py reads these
