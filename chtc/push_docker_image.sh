@@ -8,14 +8,9 @@
 
 set -euo pipefail
 
-DOCKERHUB_USER="${DOCKERHUB_USER:-<DOCKERHUB_USER>}"
+DOCKERHUB_USER="${DOCKERHUB_USER:-nevneal}"
 TAG="${TAG:-latest}"
 IMAGE="$DOCKERHUB_USER/remote_sam3:$TAG"
-
-if [[ "$DOCKERHUB_USER" == "<DOCKERHUB_USER>" ]]; then
-    echo "ERROR: set DOCKERHUB_USER, e.g. DOCKERHUB_USER=jdaniels ./chtc/push_docker_image.sh"
-    exit 1
-fi
 
 echo "[push] building $IMAGE..."
 docker build -t "$IMAGE" .
