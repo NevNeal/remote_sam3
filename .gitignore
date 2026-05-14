@@ -1,3 +1,4 @@
 *_segmentations/
 __pycache__/
 *.pyc
+instructions.md
