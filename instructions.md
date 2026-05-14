@@ -15,14 +15,14 @@ pushing results to Research Drive.
 The script files reference these placeholders. Search for `<NETID>`, etc., or
 just set them as environment variables before running the build/push scripts.
 
-| Placeholder        | What it is                                                  | Where used                            | Your value |
-| ------------------ | ----------------------------------------------------------- | ------------------------------------- | ---------- |
-| `<NETID>`          | Your CHTC username (typically your campus NetID)            | `chtc/run_tests.sub`, `build_apptainer.sh` | `___`      |
-| `<PI_SHARE_NAME>`  | Your PI's Research Drive share (the path after `//research.drive.wisc.edu/`) | `push_to_researchdrive.sh` | `___`      |
-| `<GITHUB_USER>`    | GitHub user/org if pulling the Docker image from GHCR       | `build_apptainer.sh`                  | `___`      |
-| `HF_TOKEN`         | HuggingFace token (read scope) for the gated `facebook/sam3` repo | submit env                      | `hf_...`   |
-| Research Drive auth | Are you using Kerberos (`-k`) or password auth?            | `push_to_researchdrive.sh`            | `___`      |
-| GPU Lab access     | Has CHTC granted you GPU Lab access?                        | required for `+WantGPULab = true`     | yes / no   |
+| Placeholder         | What it is                                                  | Where used                            | Your value |
+| ------------------- | ----------------------------------------------------------- | ------------------------------------- | ---------- |
+| `<NETID>`           | Your CHTC username (typically your campus NetID)            | login command in this doc             | `___`      |
+| `<DOCKERHUB_USER>`  | Your Docker Hub username                                    | `chtc/run_tests.sub`, `push_docker_image.sh` | `___`      |
+| `<PI_SHARE_NAME>`   | Your PI's Research Drive share (the path after `//research.drive.wisc.edu/`) | `push_to_researchdrive.sh` | `___`      |
+| `HF_TOKEN`          | HuggingFace token (read scope) for the gated `facebook/sam3` repo | submit env                      | `hf_...`   |
+| Research Drive auth | Are you using Kerberos (`-k`) or password auth?             | `push_to_researchdrive.sh`            | `___`      |
+| GPU Lab access      | Has CHTC granted you GPU Lab access?                        | required for `+WantGPULab = true`     | yes / no   |
 
 > Until "GPU Lab access" is granted, your jobs will sit in IDLE forever. Apply
 > via the form linked from <https://chtc.cs.wisc.edu/uw-research-computing/gpu-lab>.
@@ -31,41 +31,31 @@ just set them as environment variables before running the build/push scripts.
 
 ## One-time setup
 
-### 1. Get the code onto your CHTC submit node
+### 1. Push the Docker image to Docker Hub (from your workstation)
+
+CHTC compute nodes pull the container image directly from Docker Hub at job
+start, so this is the deployment step.
+
+```bash
+# From the repo root on your workstation:
+DOCKERHUB_USER=<DOCKERHUB_USER> ./chtc/push_docker_image.sh
+```
+
+You only need to repeat this when you change the Dockerfile or requirements.
+
+Then edit `chtc/run_tests.sub` and set:
+
+```
+container_image = docker://<DOCKERHUB_USER>/remote_sam3:latest
+```
+
+### 2. Get the code onto your CHTC submit node
 
 ```bash
 ssh <NETID>@ap2001.chtc.wisc.edu
 git clone https://github.com/NevNeal/remote_sam3.git
 cd remote_sam3
 ```
-
-### 2. Build (or fetch) the Apptainer SIF
-
-You have two options:
-
-**A. Pull from a Docker registry (recommended).** Push your local Docker image
-to GHCR or Docker Hub first, then on the submit node:
-
-```bash
-# On your workstation:
-docker build -t ghcr.io/<GITHUB_USER>/remote_sam3:latest .
-docker push  ghcr.io/<GITHUB_USER>/remote_sam3:latest
-
-# On the CHTC submit node:
-NETID=<NETID> DOCKER_IMAGE=ghcr.io/<GITHUB_USER>/remote_sam3:latest \
-  ./chtc/build_apptainer.sh
-```
-
-**B. Build locally, scp the SIF up.** If you can't push to a registry:
-
-```bash
-# On your workstation (needs apptainer installed):
-apptainer build remote_sam3.sif docker-daemon://remote-sam3:latest
-scp remote_sam3.sif <NETID>@transfer.chtc.wisc.edu:/staging/<NETID>/
-```
-
-After either path, the SIF should be at `/staging/<NETID>/remote_sam3.sif` and
-`chtc/run_tests.sub` should reference `osdf:///chtc/staging/<NETID>/remote_sam3.sif`.
 
 ### 3. Export your HuggingFace token in the submit shell
 
@@ -93,7 +83,7 @@ condor_history -limit 1          # after it ends
 
 The job will:
 
-1. Pull the SIF from `/staging`.
+1. Pull the Docker image from Docker Hub (cached on subsequent runs).
 2. Run `chtc/run_tests.sh` inside the container, which runs `test_on_chtc.py`.
 3. `test_on_chtc.py` performs four tests (environment / network / HuggingFace
    / pipeline) and writes `test_results.json`.
@@ -167,9 +157,9 @@ remote_sam3/
 ├── Dockerfile                   # PyTorch CUDA 12.4 + deps
 ├── requirements.txt
 ├── chtc/
-│   ├── run_tests.sub            # HTCondor submit file (GPU + Apptainer)
+│   ├── run_tests.sub            # HTCondor submit file (GPU + Docker Hub image)
 │   ├── run_tests.sh             # container entrypoint
-│   ├── build_apptainer.sh       # build SIF on submit node from Docker URL
+│   ├── push_docker_image.sh     # build + docker push (run on workstation)
 │   ├── push_to_researchdrive.sh # smbclient push from transfer node
 │   └── analyze_results.py       # log + JSON summarizer
 └── instructions.md              # this file

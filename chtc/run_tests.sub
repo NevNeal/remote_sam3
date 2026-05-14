@@ -1,9 +1,8 @@
 # HTCondor submit file for CHTC GPU test job.
 #
 # Submit from a CHTC access point (e.g. ap2001.chtc.wisc.edu) after:
-#   1. building the Apptainer SIF (see chtc/build_apptainer.sh)
-#   2. uploading the SIF to /staging/<NETID>/remote_sam3.sif
-#   3. setting HF_TOKEN in your shell environment
+#   1. pushing your Docker image to Docker Hub (or GHCR)
+#   2. setting HF_TOKEN in your shell environment
 #
 # Usage:
 #   condor_submit chtc/run_tests.sub
@@ -13,10 +12,10 @@
 #   python chtc/analyze_results.py logs/test.<cluster>.<process>
 
 # ============================================================================
-# Container — point at the SIF you uploaded to /staging
+# Container — pulled from Docker Hub at job start; HTCondor caches it
 # ============================================================================
-# Replace <NETID> with your CHTC username before submitting.
-container_image = osdf:///chtc/staging/<NETID>/remote_sam3.sif
+# Replace <DOCKERHUB_USER> with your Docker Hub username (or use ghcr.io/... for GHCR).
+container_image = docker://<DOCKERHUB_USER>/remote_sam3:latest
 
 # ============================================================================
 # Executable + arguments
@@ -39,8 +38,7 @@ request_disk = 20GB
 # Optional: pin to a minimum GPU memory (uncomment if SAM3 OOMs on small GPUs)
 # gpus_minimum_memory = 16000
 
-# CHTC staging is required because the container image lives there.
-requirements = (HasCHTCStaging == true)
+# (No staging requirement — container is pulled from Docker Hub.)
 
 # ============================================================================
 # Environment — pass HF_TOKEN from submit env so the gated SAM3 repo works
