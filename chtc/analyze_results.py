@@ -164,6 +164,20 @@ def main():
                 f = d["files"]
                 print(f"             output: {f.get('images', 0)} images, {f.get('masks', 0)} masks, {f.get('overlays', 0)} overlays")
                 print(f"             base  : {d.get('output_base')}")
+            # On failure, print captured stderr/stdout from the subprocess + traceback
+            if r["status"] == "failed":
+                if d.get("stderr_tail"):
+                    print("             --- subprocess stderr (tail) ---")
+                    for line in d["stderr_tail"].splitlines()[-30:]:
+                        print(f"             {line}")
+                if d.get("stdout_tail"):
+                    print("             --- subprocess stdout (tail) ---")
+                    for line in d["stdout_tail"].splitlines()[-15:]:
+                        print(f"             {line}")
+                if r.get("traceback"):
+                    print("             --- python traceback ---")
+                    for line in r["traceback"].splitlines()[-15:]:
+                        print(f"             {line}")
     else:
         print(f"  (no results JSON at {test_info['path']})")
 
