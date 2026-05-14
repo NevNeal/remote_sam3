@@ -1,0 +1,77 @@
+# HTCondor submit file for CHTC GPU test job.
+#
+# Submit from a CHTC access point (e.g. ap2001.chtc.wisc.edu) after:
+#   1. building the Apptainer SIF (see chtc/build_apptainer.sh)
+#   2. uploading the SIF to /staging/<NETID>/remote_sam3.sif
+#   3. setting HF_TOKEN in your shell environment
+#
+# Usage:
+#   condor_submit chtc/run_tests.sub
+#
+# After completion:
+#   condor_history -limit 1 -af JobStatus ExitCode RemoteWallClockTime
+#   python chtc/analyze_results.py logs/test.<cluster>.<process>
+
+# ============================================================================
+# Container — point at the SIF you uploaded to /staging
+# ============================================================================
+# Replace <NETID> with your CHTC username before submitting.
+container_image = osdf:///chtc/staging/<NETID>/remote_sam3.sif
+
+# ============================================================================
+# Executable + arguments
+# ============================================================================
+executable = chtc/run_tests.sh
+# arguments: taxon_id  output_dir  limit
+arguments  = 591507 test_output 1
+
+# ============================================================================
+# GPU Lab request — required for any GPU job at CHTC
+# ============================================================================
++WantGPULab = true
++GPUJobLength = "short"
+
+request_gpus = 1
+request_cpus = 2
+request_memory = 16GB
+request_disk = 20GB
+
+# Optional: pin to a minimum GPU memory (uncomment if SAM3 OOMs on small GPUs)
+# gpus_minimum_memory = 16000
+
+# CHTC staging is required because the container image lives there.
+requirements = (HasCHTCStaging == true)
+
+# ============================================================================
+# Environment — pass HF_TOKEN from submit env so the gated SAM3 repo works
+# ============================================================================
+getenv = HF_TOKEN
+# Point HuggingFace cache at the job's scratch dir so it stays inside the
+# transferable working directory and you can inspect it on output.
+environment = "HF_HOME=$(CONDOR_SCRATCH_DIR)/hf_cache"
+
+# ============================================================================
+# File transfer
+# ============================================================================
+should_transfer_files = YES
+when_to_transfer_output = ON_EXIT
+
+# Inputs: only the scripts; the SIF is referenced by container_image, not transferred here.
+transfer_input_files = test_on_chtc.py, segmentation_pipeline.py, chtc/run_tests.sh
+
+# Outputs: HTCondor automatically transfers everything created in the job's
+# working directory, except large bind-mounted paths. We rely on that default
+# so test_output/, test_results.json, and any logs come back.
+
+# ============================================================================
+# Log files — analyze_results.py reads these
+# ============================================================================
+log    = logs/test.$(Cluster).$(Process).log
+output = logs/test.$(Cluster).$(Process).out
+error  = logs/test.$(Cluster).$(Process).err
+
+# Keep the job alive after Held so you can read the hold reason.
+on_exit_hold = (ExitCode != 0)
+on_exit_hold_reason = "Job exited non-zero — see *.err and test_results.json"
+
+queue 1
