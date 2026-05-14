@@ -22,7 +22,7 @@ container_image = docker://nevneal/remote_sam3:latest
 executable = chtc/run_tests.sh
 # arguments: taxon_id  output_dir  [limit]
 # Omit the third argument to process ALL images in the taxon.
-arguments  = 593537 test_output
+arguments  = 593537 test_output 50
 
 # ============================================================================
 # GPU Lab request — required for any GPU job at CHTC
