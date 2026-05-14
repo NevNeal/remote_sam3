@@ -43,9 +43,8 @@ request_disk = 20GB
 # Environment — pass HF_TOKEN from submit env so the gated SAM3 repo works
 # ============================================================================
 getenv = HF_TOKEN
-# Point HuggingFace cache at the job's scratch dir so it stays inside the
-# transferable working directory and you can inspect it on output.
-environment = "HF_HOME=$(CONDOR_SCRATCH_DIR)/hf_cache"
+# HF_HOME is set inside run_tests.sh using the runtime $PWD so the cache lands
+# in the job's scratch dir and comes back via HTCondor's default output transfer.
 
 # ============================================================================
 # File transfer

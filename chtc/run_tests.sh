@@ -9,7 +9,11 @@ TAXON_ID="${1:-591507}"
 OUTPUT_DIR="${2:-test_output}"
 LIMIT="${3:-1}"
 
+export HF_HOME="$PWD/hf_cache"
+mkdir -p "$HF_HOME"
+
 echo "[run_tests.sh] PWD=$PWD"
+echo "[run_tests.sh] HF_HOME=$HF_HOME"
 echo "[run_tests.sh] taxon=$TAXON_ID output=$OUTPUT_DIR limit=$LIMIT"
 echo "[run_tests.sh] nvidia-smi:"
 nvidia-smi || echo "  (nvidia-smi not available in container)"
