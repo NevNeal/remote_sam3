@@ -131,9 +131,9 @@ def test_pipeline(detail, taxon_id, output_dir, limit, script_path):
         str(script_path),
         str(taxon_id),
         output_dir,
-        "--limit",
-        str(limit),
     ]
+    if limit is not None:
+        cmd += ["--limit", str(limit)]
     detail["command"] = " ".join(cmd)
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     detail["returncode"] = proc.returncode
@@ -159,7 +159,8 @@ def main():
     parser = argparse.ArgumentParser(description="CHTC GPU node test harness")
     parser.add_argument("--taxon-id", type=int, default=591507)
     parser.add_argument("--output-dir", default="test_output")
-    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Stop the pipeline after N images. Omit to process all.")
     parser.add_argument("--results-file", default="test_results.json")
     parser.add_argument("--pipeline-script", default=None,
                         help="Path to segmentation_pipeline.py (default: next to this script)")

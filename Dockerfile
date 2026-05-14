@@ -9,10 +9,12 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY segmentation_pipeline.py .
+COPY segmentation_pipeline.py test_on_chtc.py ./
 
-# Mount your output directory to /app/<output_folder> at runtime.
-# Pass HF_TOKEN as an env var to access gated models:
-#   docker run --gpus all -e HF_TOKEN=hf_... -v /host/output:/app/output ...
-
-ENTRYPOINT ["python", "segmentation_pipeline.py"]
+# No ENTRYPOINT — the caller specifies the command. Examples:
+#   docker run --gpus all -e HF_TOKEN=hf_... remote_sam3 \
+#       python segmentation_pipeline.py 591507 output --limit 1
+#   docker run --gpus all -e HF_TOKEN=hf_... remote_sam3 \
+#       python test_on_chtc.py --taxon-id 591507
+# CHTC's HTCondor container universe passes its own command, which would
+# otherwise conflict with a fixed ENTRYPOINT.
