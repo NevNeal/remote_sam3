@@ -14,8 +14,7 @@
 # ============================================================================
 # Container — pulled from Docker Hub at job start; HTCondor caches it
 # ============================================================================
-# Replace <DOCKERHUB_USER> with your Docker Hub username (or use ghcr.io/... for GHCR).
-container_image = docker://<DOCKERHUB_USER>/remote_sam3:latest
+container_image = docker://nevneal/remote_sam3:latest
 
 # ============================================================================
 # Executable + arguments
