@@ -829,6 +829,7 @@ CSV_HEADER = [
     "avg_RGB",
     "status",
     "error",
+    "segmentation_duration_sec",
 ]
 
 
@@ -1114,6 +1115,8 @@ def run_segmentation():
                 taxon_name = str(row["taxon_name"])
                 url = str(row["photo_url_original"])
 
+                seg_duration_sec = ""
+
                 try:
                     returned_global_index, status, data, error = future.result()
                     assert returned_global_index == global_index
@@ -1139,6 +1142,7 @@ def run_segmentation():
                                 "",
                                 "dl_failed",
                                 error or "",
+                                seg_duration_sec,
                             ])
 
                             log_error(
@@ -1162,6 +1166,8 @@ def run_segmentation():
                             image_pil = Image.open(BytesIO(data)).convert("RGB")
                         else:
                             image_pil = Image.open(image_path).convert("RGB")
+
+                        seg_start = time.perf_counter()
 
                         inputs = processor(
                             images=image_pil,
@@ -1253,6 +1259,8 @@ def run_segmentation():
                                 if valid_instances == 0:
                                     no_detection_overlay_count += 1
 
+                        seg_duration_sec = round(time.perf_counter() - seg_start, 3)
+
                         append_csv_row(OUT_CSV, [
                             global_index,
                             batch_name,
@@ -1270,6 +1278,7 @@ def run_segmentation():
                             avg_rgb_str,
                             "ok",
                             "",
+                            seg_duration_sec,
                         ])
 
                         ok_count += 1
@@ -1296,6 +1305,7 @@ def run_segmentation():
                             "",
                             "seg_failed",
                             str(error),
+                            seg_duration_sec,
                         ])
 
                         log_error(
