@@ -10,7 +10,15 @@
 # Usage:
 #   ./chtc/push_to_researchdrive.sh <local_dir> <remote_subpath>
 # Example:
-#   ./chtc/push_to_researchdrive.sh test_output/ sam3/2026-05-14/591507
+#   ./chtc/push_to_researchdrive.sh test_output sam3/2026-05-14/593537
+#
+# Authentication (pick one):
+#   1. Username + password via env vars (recommended for scripted use):
+#        SMB_USER=dli55 SMB_PASS='your-password' ./chtc/push_to_researchdrive.sh ...
+#   2. Username only — smbclient will prompt for the password:
+#        SMB_USER=dli55 ./chtc/push_to_researchdrive.sh ...
+#   3. Kerberos (only if your CHTC account is tied to your campus NetID):
+#        USE_KERBEROS=1 ./chtc/push_to_researchdrive.sh ...
 #
 # Side effects:
 #   - tars the local dir to a temp file
@@ -22,16 +30,40 @@ set -euo pipefail
 LOCAL_DIR="${1:?usage: push_to_researchdrive.sh <local_dir> <remote_subpath>}"
 REMOTE_SUBPATH="${2:?usage: push_to_researchdrive.sh <local_dir> <remote_subpath>}"
 
-PI_SHARE="${PI_SHARE:-<PI_SHARE_NAME>}"
-USE_KERBEROS="${USE_KERBEROS:-1}"
-
-if [[ "$PI_SHARE" == "<PI_SHARE_NAME>" ]]; then
-    echo "ERROR: set PI_SHARE env var, e.g. PI_SHARE=jadams"
-    exit 1
-fi
+PI_SHARE="${PI_SHARE:-dli55}"
+SMB_USER="${SMB_USER:-}"
+SMB_PASS="${SMB_PASS:-}"
+USE_KERBEROS="${USE_KERBEROS:-0}"
 
 if [[ ! -d "$LOCAL_DIR" ]]; then
     echo "ERROR: local dir not found: $LOCAL_DIR"
+    exit 1
+fi
+
+# Build smbclient args + authentication
+SMBCLIENT_ARGS=(//research.drive.wisc.edu/"$PI_SHARE")
+CREDS_FILE=""
+
+if [[ "$USE_KERBEROS" == "1" ]]; then
+    SMBCLIENT_ARGS+=(-k)
+elif [[ -n "$SMB_USER" && -n "$SMB_PASS" ]]; then
+    # Write a temp credentials file with 600 perms so the password never
+    # appears on the command line or in /proc.
+    CREDS_FILE=$(mktemp)
+    chmod 600 "$CREDS_FILE"
+    cat > "$CREDS_FILE" <<EOF
+username=$SMB_USER
+password=$SMB_PASS
+EOF
+    SMBCLIENT_ARGS+=(--authentication-file="$CREDS_FILE")
+    trap 'rm -f "$CREDS_FILE"' EXIT
+elif [[ -n "$SMB_USER" ]]; then
+    # smbclient will prompt for the password interactively
+    SMBCLIENT_ARGS+=(-U "$SMB_USER")
+else
+    echo "ERROR: no authentication configured."
+    echo "  Set SMB_USER and SMB_PASS, or USE_KERBEROS=1."
+    echo "  Example: SMB_USER=dli55 SMB_PASS='...' ./chtc/push_to_researchdrive.sh test_output sam3/test"
     exit 1
 fi
 
@@ -45,9 +77,6 @@ END_TAR=$(date +%s)
 
 TAR_BYTES=$(stat -c%s "$TAR_PATH")
 echo "[push] tar size: $(numfmt --to=iec "$TAR_BYTES")"
-
-SMBCLIENT_ARGS=(//research.drive.wisc.edu/"$PI_SHARE")
-[[ "$USE_KERBEROS" == "1" ]] && SMBCLIENT_ARGS+=(-k)
 
 echo "[push] creating remote dir $REMOTE_SUBPATH (errors ignored if it exists)"
 echo "mkdir \"$REMOTE_SUBPATH\"; quit" | smbclient "${SMBCLIENT_ARGS[@]}" >/dev/null 2>&1 || true
