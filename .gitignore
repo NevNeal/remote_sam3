@@ -3,3 +3,5 @@ test_output/
 __pycache__/
 *.pyc
 instructions.md
+PROJECT_SUMMARY.md
+.claude/
