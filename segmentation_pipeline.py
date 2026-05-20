@@ -45,6 +45,10 @@ import os
 import re
 import csv
 import time
+import shutil
+import tarfile
+import threading
+import subprocess
 from io import BytesIO
 from typing import Dict, Any, Optional
 
@@ -108,8 +112,21 @@ SEGMENTS_PNGS = os.path.join(BASE_DIR, "segments_pngs")
 OUT_CSV = os.path.join(BASE_DIR, "mask_summary.csv")
 ERR_LOG = os.path.join(BASE_DIR, "errors.txt")
 
-# Batch size
-BATCH_SIZE = 10_000
+# Batch size — also the unit of incremental Research Drive shipping.
+BATCH_SIZE = 1_000
+
+# ----- Incremental batch shipping (CHTC) -----
+# The A100 compute node cannot reach Research Drive directly. When SHIP_BATCHES=1
+# (set by chtc/run_a100.sh), a background thread tars each *completed* 1000-image
+# batch and ships it off the compute node via `condor_chirp put` to the job's
+# spool on the access node. A watcher there (chtc/watch_and_push.sh) pushes each
+# tar to Research Drive. Shipping is idempotent and disabled by default, so local
+# runs are unaffected.
+SHIP_BATCHES = os.environ.get("SHIP_BATCHES", "0") == "1"
+SHIP_POLL_SEC = float(os.environ.get("SHIP_POLL_SEC", "30"))
+# Command template to ship one tar off the node. {src} = local tar path,
+# {dst} = remote name placed in the job spool. Default uses condor_chirp.
+SHIP_CMD = os.environ.get("SHIP_CMD", "condor_chirp put {src} {dst}")
 
 # Download settings
 MAX_WORKERS = 1
@@ -1006,6 +1023,159 @@ def update_metadata_csv_with_avg_rgb():
 
 
 # ============================================================
+# 12b) INCREMENTAL BATCH SHIPPING
+# ============================================================
+#
+# A batch is "complete" once every image that belongs to it (across all runs)
+# has a row in mask_summary.csv with status ok/dl_failed/seg_failed. We tar each
+# completed batch's images/masks/overlays plus its slice of mask_summary.csv,
+# then run SHIP_CMD to push the tar off the compute node. State is kept in
+# _shipped_batches.txt so a batch is shipped at most once per job. Re-shipping
+# across job restarts is harmless: the access-node watcher is idempotent.
+
+SHIP_DIR = os.path.join(BASE_DIR, "_ship")
+SHIPPED_STATE = os.path.join(BASE_DIR, "_shipped_batches.txt")
+
+
+def load_shipped_batches() -> set:
+    if not os.path.exists(SHIPPED_STATE):
+        return set()
+    with open(SHIPPED_STATE, "r", encoding="utf-8") as file:
+        return {line.strip() for line in file if line.strip()}
+
+
+def record_shipped_batch(batch_name: str):
+    with open(SHIPPED_STATE, "a", encoding="utf-8") as file:
+        file.write(batch_name + "\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+
+def write_batch_csv_slice(batch_name: str, dest_path: str) -> bool:
+    try:
+        df_sum = pd.read_csv(OUT_CSV)
+    except Exception:
+        return False
+    if "batch_name" not in df_sum.columns:
+        return False
+    df_batch = df_sum[df_sum["batch_name"].astype(str) == batch_name]
+    if df_batch.empty:
+        return False
+    df_batch.to_csv(dest_path, index=False)
+    return True
+
+
+def tar_batch(batch_name: str) -> Optional[str]:
+    """Tar one batch's images/masks/overlays + its CSV slice. Returns tar path."""
+    os.makedirs(SHIP_DIR, exist_ok=True)
+    tar_path = os.path.join(SHIP_DIR, f"{batch_name}.tar.gz")
+    tmp_path = tar_path + ".part"
+
+    members = []
+    for sub_base, sub_name in (
+        (IMAGE_BASE, "images"),
+        (MASK_BASE, "masks"),
+        (OVERLAY_BASE, "overlays"),
+    ):
+        batch_dir = os.path.join(sub_base, batch_name)
+        if os.path.isdir(batch_dir):
+            members.append((batch_dir, f"{sub_name}/{batch_name}"))
+
+    if not members:
+        return None
+
+    csv_slice = os.path.join(SHIP_DIR, f"mask_summary_{batch_name}.csv")
+    have_csv = write_batch_csv_slice(batch_name, csv_slice)
+
+    with tarfile.open(tmp_path, "w:gz") as tar:
+        for src_dir, arcname in members:
+            tar.add(src_dir, arcname=arcname)
+        if have_csv:
+            tar.add(csv_slice, arcname=f"mask_summary_{batch_name}.csv")
+
+    os.replace(tmp_path, tar_path)
+    if have_csv:
+        try:
+            os.remove(csv_slice)
+        except OSError:
+            pass
+    return tar_path
+
+
+def ship_tar(tar_path: str) -> bool:
+    remote_name = os.path.basename(tar_path)
+    cmd = SHIP_CMD.format(src=tar_path, dst=remote_name)
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    except Exception as error:
+        print(f"[ship] FAILED to launch ship cmd for {remote_name}: {error}")
+        return False
+    if result.returncode != 0:
+        print(f"[ship] ship cmd returned {result.returncode} for {remote_name}: "
+              f"{result.stderr.strip()[:400]}")
+        return False
+    print(f"[ship] shipped {remote_name}")
+    return True
+
+
+def scan_and_ship(batch_to_indices: Dict[str, set], shipped: set):
+    """Ship every newly-completed, not-yet-shipped batch."""
+    done = load_done_global_indices(OUT_CSV)
+    for batch_name in sorted(batch_to_indices):
+        if batch_name in shipped:
+            continue
+        if not batch_to_indices[batch_name].issubset(done):
+            continue
+        tar_path = tar_batch(batch_name)
+        if tar_path is None:
+            continue
+        if ship_tar(tar_path):
+            shipped.add(batch_name)
+            record_shipped_batch(batch_name)
+            try:
+                os.remove(tar_path)
+            except OSError:
+                pass
+
+
+def start_batch_shipper(df, stop_event: threading.Event) -> Optional[threading.Thread]:
+    if not SHIP_BATCHES:
+        return None
+
+    ship_tmpl = SHIP_CMD.split("{", 1)[0].strip().split()
+    ship_bin = ship_tmpl[0] if ship_tmpl else ""
+    if ship_bin and shutil.which(ship_bin) is None:
+        print(f"[ship] SHIP_BATCHES=1 but '{ship_bin}' not found on PATH — "
+              f"incremental shipping disabled (results still transfer on exit).")
+        return None
+
+    batch_to_indices: Dict[str, set] = {
+        str(name): set(int(g) for g in group)
+        for name, group in df.groupby("batch_name")["global_index"]
+    }
+    shipped = load_shipped_batches()
+    print(f"[ship] incremental shipping ON — {len(batch_to_indices)} batches, "
+          f"{len(shipped)} already shipped this job. poll={SHIP_POLL_SEC}s")
+
+    def worker():
+        while not stop_event.is_set():
+            try:
+                scan_and_ship(batch_to_indices, shipped)
+            except Exception as error:
+                print(f"[ship] scan error: {error}")
+            stop_event.wait(SHIP_POLL_SEC)
+        # Final pass after the segmentation loop signals completion.
+        try:
+            scan_and_ship(batch_to_indices, shipped)
+        except Exception as error:
+            print(f"[ship] final scan error: {error}")
+
+    thread = threading.Thread(target=worker, name="batch-shipper", daemon=True)
+    thread.start()
+    return thread
+
+
+# ============================================================
 # 13) SEGMENTATION PIPELINE
 # ============================================================
 
@@ -1029,8 +1199,21 @@ def run_segmentation():
         df_todo = df_todo.head(LIMIT)
     print("Remaining to segment:", f"{len(df_todo):,}")
 
+    # Shipper scope = images we already have + images we're about to process.
+    # A batch ships once every image in this scope has a logged row, so a
+    # LIMIT-truncated final batch still completes instead of stalling forever.
+    scope_indices = set(int(g) for g in done)
+    scope_indices |= set(int(g) for g in df_todo["global_index"])
+    df_scope = df[df["global_index"].isin(scope_indices)]
+
+    stop_event = threading.Event()
+    shipper = start_batch_shipper(df_scope, stop_event)
+
     if len(df_todo) == 0:
         print("Nothing left to segment.")
+        if shipper is not None:
+            stop_event.set()
+            shipper.join()
         return
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1321,6 +1504,14 @@ def run_segmentation():
                     in_flight[next_future] = int(next_row["global_index"])
 
     progress.close()
+
+    # Stop the shipper and let it ship any remaining completed batches
+    # (including the final partial batch) before we return.
+    if shipper is not None:
+        print("[ship] segmentation loop done — flushing remaining batches...")
+        stop_event.set()
+        shipper.join()
+        print("[ship] shipper finished.")
 
     print("\nDone.")
     print("Logged OK:", f"{ok_count:,}")
