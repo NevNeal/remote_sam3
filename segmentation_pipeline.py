@@ -135,6 +135,11 @@ CHUNK_BYTES = 1024 * 1024
 SLEEP_BETWEEN_REQUESTS_SEC = 0.0
 SKIP_IF_EXISTS = True
 
+# If True, an image (and its overlay) is kept only when SAM3 produces at least
+# one mask. Images with zero detections are not written to disk and are logged
+# with status "no_masks" so a resumed run does not reprocess them.
+SAVE_ONLY_IMAGES_WITH_MASKS = True
+
 # SAM3 settings
 TEXT_PROMPT = _args.prompt if _args.prompt is not None else "flower"
 SCORE_THRESHOLD = 0.85
@@ -877,7 +882,7 @@ def load_done_global_indices(path) -> set:
 
     try:
         df_done = pd.read_csv(path, usecols=["global_index", "status"])
-        df_done = df_done[df_done["status"].astype(str).isin(["ok", "dl_failed", "seg_failed"])]
+        df_done = df_done[df_done["status"].astype(str).isin(["ok", "no_masks", "dl_failed", "seg_failed"])]
 
         for value in df_done["global_index"].dropna().tolist():
             try:
@@ -1249,6 +1254,7 @@ def run_segmentation():
     progress = tqdm(total=total_todo, desc="Download + SAM3 segment", dynamic_ncols=True)
 
     ok_count = 0
+    no_mask_count = 0
     dl_failed = 0
     seg_failed = 0
     skipped_existing_download = 0
@@ -1339,10 +1345,11 @@ def run_segmentation():
                         os.makedirs(mask_dir, exist_ok=True)
                         os.makedirs(overlay_dir, exist_ok=True)
 
-                        if status == "downloaded" and data is not None:
-                            write_bytes_atomic(image_path, data)
-
-                        elif status == "exists":
+                        # The image bytes are NOT written to disk yet. When
+                        # SAVE_ONLY_IMAGES_WITH_MASKS is on we keep the image only
+                        # if segmentation finds at least one mask, so the write is
+                        # deferred until after inference (below).
+                        if status == "exists":
                             skipped_existing_download += 1
 
                         if status == "downloaded" and data is not None:
@@ -1425,7 +1432,23 @@ def run_segmentation():
                             if rgb_value is not None
                         )
 
-                        if MAKE_OVERLAY_FOR_EVERY_SEGMENTED_IMAGE:
+                        keep_image = num_instances > 0 or not SAVE_ONLY_IMAGES_WITH_MASKS
+
+                        if keep_image:
+                            # Persist the image now that we know it has masks
+                            # (the write was deferred above).
+                            if status == "downloaded" and data is not None:
+                                write_bytes_atomic(image_path, data)
+                            status_value = "ok"
+                        else:
+                            # No masks: drop the image and skip the overlay.
+                            if os.path.exists(image_path):
+                                os.remove(image_path)
+                            image_relpath = ""
+                            overlay_relpath = ""
+                            status_value = "no_masks"
+
+                        if keep_image and MAKE_OVERLAY_FOR_EVERY_SEGMENTED_IMAGE:
                             if os.path.exists(overlay_path) and not OVERWRITE_EXISTING_OVERLAYS:
                                 overlay_relpath = os.path.relpath(overlay_path, BASE_DIR)
                             else:
@@ -1459,12 +1482,15 @@ def run_segmentation():
                             mask_files_str,
                             mask_scores_str,
                             avg_rgb_str,
-                            "ok",
+                            status_value,
                             "",
                             seg_duration_sec,
                         ])
 
-                        ok_count += 1
+                        if keep_image:
+                            ok_count += 1
+                        else:
+                            no_mask_count += 1
                         progress.update(1)
 
                 except Exception as error:
@@ -1514,7 +1540,8 @@ def run_segmentation():
         print("[ship] shipper finished.")
 
     print("\nDone.")
-    print("Logged OK:", f"{ok_count:,}")
+    print("Logged OK (saved, has masks):", f"{ok_count:,}")
+    print("No masks (image not saved):", f"{no_mask_count:,}")
     print("Download failed:", f"{dl_failed:,}")
     print("Segmentation failed:", f"{seg_failed:,}")
     print("Skipped download because image already existed:", f"{skipped_existing_download:,}")
