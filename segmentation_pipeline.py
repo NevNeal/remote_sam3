@@ -74,7 +74,7 @@ _parser = argparse.ArgumentParser(description="iNaturalist SAM3 segmentation pip
 _parser.add_argument("taxon_id", type=int, help="iNaturalist taxon ID to process")
 _parser.add_argument("output_folder", help="Name of the output folder (created inside the script directory)")
 _parser.add_argument("--limit", type=int, default=None, help="Stop after processing this many images")
-_parser.add_argument("--prompt", type=str, default=None, help="SAM3 text prompt (default: 'open flower')")
+_parser.add_argument("--prompt", type=str, default=None, help="SAM3 text prompt (default: 'flower')")
 _args = _parser.parse_args()
 
 
@@ -136,7 +136,7 @@ SLEEP_BETWEEN_REQUESTS_SEC = 0.0
 SKIP_IF_EXISTS = True
 
 # SAM3 settings
-TEXT_PROMPT = _args.prompt if _args.prompt is not None else "open flower"
+TEXT_PROMPT = _args.prompt if _args.prompt is not None else "flower"
 SCORE_THRESHOLD = 0.85
 MASK_THRESHOLD = 0.8
 LOG_FAILURES = True

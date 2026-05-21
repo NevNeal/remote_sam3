@@ -1,0 +1,76 @@
+# HTCondor submit file: run the MAIN segmentation_pipeline.py on a single GPU
+# for taxon 62741 (Rudbeckia hirta, ~86k observations).
+#
+# Submit from a CHTC access point (e.g. ap2001.chtc.wisc.edu) after:
+#   1. pushing the Docker image to Docker Hub
+#   2. exporting HF_TOKEN in the SAME shell you submit from (getenv copies it):
+#        export HF_TOKEN=hf_xxxxxxxx
+#
+#   condor_submit chtc/run_a100_62741.sub
+#
+# When the job finishes, the full output folder is back on the access point.
+# Push it to Research Drive once from a node that can reach RD:
+#   ssh <NETID>@transfer.chtc.wisc.edu
+#   cd remote_sam3
+#   SMB_USER=<NETID> SMB_PASS='...' \
+#     ./chtc/push_to_researchdrive.sh output_62741 sam3/$(date +%F)/62741
+
+# ============================================================================
+# Container
+# ============================================================================
+container_image = docker://nevneal/remote_sam3:latest
+
+# ============================================================================
+# Executable + arguments  (taxon_id  output_dir  [prompt])
+# Default prompt is now "flower" (set in segmentation_pipeline.py).
+# ============================================================================
+executable = chtc/run_a100.sh
+arguments  = 62741 output_62741
+
+# ============================================================================
+# GPU: any card with >= 39 GB (A100 40/80GB, H100, H200). 39000 is a memory
+# floor, not an A100-specific match, so larger/faster cards are also accepted.
+# ============================================================================
++WantGPULab         = true
++GPUJobLength       = "long"
+request_gpus        = 1
+gpus_minimum_memory = 39000
+
+request_cpus   = 4
+request_memory = 32GB
+# ~86k observations can expand to ~150-200k photo rows; images + masks (.npy) +
+# overlays can run to hundreds of GB. Scratch must hold the ENTIRE taxon output
+# at once (no incremental shipping). Start generous and re-check after a partial
+# run: roughly avg_per_image_bytes * num_images * ~1.3.
+request_disk   = 400GB
+
+# ============================================================================
+# File transfer
+# ON_EXIT_OR_EVICT: partial output is also transferred back when the job is
+# evicted, and restored to scratch on restart. Combined with the pipeline's
+# mask_summary.csv resume, a preempted long run continues instead of starting
+# over. There is no condor_chirp / incremental batch shipping.
+# ============================================================================
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT_OR_EVICT
+
+transfer_input_files  = segmentation_pipeline.py, chtc/run_a100.sh
+transfer_output_files = output_62741
+
+# ============================================================================
+# Environment — HF_TOKEN for the gated facebook/sam3 repo (must be exported in
+# the submit shell; the run_a100.sh log prints "HF_TOKEN present: yes").
+# ============================================================================
+getenv = HF_TOKEN
+
+# ============================================================================
+# Logs
+# ============================================================================
+log    = logs/a100_62741.$(Cluster).$(Process).log
+output = logs/a100_62741.$(Cluster).$(Process).out
+error  = logs/a100_62741.$(Cluster).$(Process).err
+
+on_exit_hold        = (ExitCode != 0)
+on_exit_hold_reason = "Job exited non-zero — see *.err"
+
+queue 1
