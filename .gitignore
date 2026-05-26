@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 instructions.md
 PROJECT_SUMMARY.md
+design_doc.md
 .claude/
