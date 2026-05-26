@@ -88,7 +88,7 @@ def load_photos_from_parquet():
     p = str(PARQUET).replace("\\", "/")
     print(f"Querying parquet: taxon_id={TAXON_ID} ...")
     t0 = time.time()
-    con = duckdb.connect(read_only=True)
+    con = duckdb.connect()
     df = con.execute(f"""
         SELECT
             photo_id,
@@ -471,3 +471,4 @@ def run_segmentation():
 
 if __name__ == "__main__":
     run_segmentation()
+

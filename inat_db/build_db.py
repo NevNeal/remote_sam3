@@ -80,9 +80,12 @@ def build_parquet():
     print("  (This may take 20-60 min depending on disk speed.)")
 
     t0 = time.time()
+    tmp_dir = str(DATA_DIR / "duckdb_tmp").replace("\\", "/")
     con = duckdb.connect()
-    con.execute("SET threads = 4")
-    con.execute("SET memory_limit = '12GB'")
+    con.execute("SET threads = 2")
+    con.execute("SET memory_limit = '8GB'")
+    con.execute(f"SET temp_directory = '{tmp_dir}'")
+    con.execute("SET preserve_insertion_order = false")
 
     p_photos = str(PHOTOS_GZ).replace("\\", "/")
     p_obs    = str(OBS_GZ).replace("\\", "/")
@@ -117,7 +120,6 @@ def build_parquet():
                                     'name':'VARCHAR','active':'VARCHAR'}}) t
               ON o.taxon_id = t.taxon_id
             WHERE o.quality_grade = 'research'
-            ORDER BY TRY_CAST(o.taxon_id AS INTEGER)
         )
         TO '{p_out}' (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE 500000)
     """
@@ -126,7 +128,7 @@ def build_parquet():
 
     elapsed = time.time() - t0
     gb = PARQUET.stat().st_size / 1e9
-    con2 = duckdb.connect(read_only=True)
+    con2 = duckdb.connect()
     row_count = con2.execute(f"SELECT COUNT(*) FROM read_parquet('{p_out}')").fetchone()[0]
     con2.close()
 
@@ -143,7 +145,7 @@ def benchmark_query(taxon_id=53324):
         return
     p_out = str(PARQUET).replace("\\", "/")
     print(f"\n=== Query benchmark (taxon_id={taxon_id}) ===")
-    con = duckdb.connect(read_only=True)
+    con = duckdb.connect()
     t0 = time.time()
     df = con.execute(f"""
         SELECT photo_id, extension, taxon_name
@@ -179,3 +181,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
