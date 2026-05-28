@@ -18,7 +18,6 @@ import argparse, os, re, csv, time
 from io import BytesIO
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import pandas as pd
 import requests
@@ -82,26 +81,17 @@ for d in [BASE_DIR, IMAGE_BASE, MASK_BASE, OVERLAY_BASE]:
 def load_photos_from_parquet():
     if not PARQUET.exists():
         raise FileNotFoundError(
-            f"Parquet not found: {PARQUET}\n"
+            f"Parquet not found: {PARQUET}. "
             "Run:  python inat_db/build_db.py"
         )
-    p = str(PARQUET).replace("\\", "/")
-    print(f"Querying parquet: taxon_id={TAXON_ID} ...")
+    print(f"Reading parquet: taxon_id={TAXON_ID} ...")
     t0 = time.time()
-    con = duckdb.connect()
-    df = con.execute(f"""
-        SELECT
-            photo_id,
-            extension,
-            taxon_name,
-            taxon_id,
-            latitude,
-            longitude
-        FROM read_parquet('{p}')
-        WHERE taxon_id = {TAXON_ID}
-        ORDER BY photo_id
-    """).df()
-    con.close()
+    df = pd.read_parquet(
+        PARQUET,
+        columns=["photo_id", "extension", "taxon_name", "taxon_id",
+                 "latitude", "longitude"],
+        filters=[("taxon_id", "==", TAXON_ID)],
+    ).sort_values("photo_id").reset_index(drop=True)
     elapsed = time.time() - t0
     print(f"  {len(df):,} photos found in {elapsed:.3f}s")
     if df.empty:

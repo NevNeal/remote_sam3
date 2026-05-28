@@ -28,7 +28,6 @@ import argparse, os, re, csv, time
 from io import BytesIO
 from pathlib import Path
 
-import duckdb
 import numpy as np
 import pandas as pd
 import requests
@@ -96,27 +95,17 @@ for d in [BASE_DIR, IMAGE_BASE, MASK_BASE, OVERLAY_BASE, SEGMENT_BASE]:
 def load_photos_from_parquet():
     if not PARQUET.exists():
         raise FileNotFoundError(
-            f"Parquet not found: {PARQUET}\n"
+            f"Parquet not found: {PARQUET}. "
             "Stage it from /staging via transfer_input_files, or pass --parquet."
         )
-    p = str(PARQUET).replace("\\", "/")
-    print(f"Querying parquet: taxon_id={TAXON_ID}  ({p})")
+    print(f"Reading parquet: taxon_id={TAXON_ID}  ({PARQUET})")
     t0 = time.time()
-    con = duckdb.connect()
-    df = con.execute(f"""
-        SELECT
-            photo_id,
-            extension,
-            taxon_id,
-            taxon_name,
-            quality_grade,
-            latitude,
-            longitude
-        FROM read_parquet('{p}')
-        WHERE taxon_id = {TAXON_ID}
-        ORDER BY photo_id
-    """).df()
-    con.close()
+    df = pd.read_parquet(
+        PARQUET,
+        columns=["photo_id", "extension", "taxon_id", "taxon_name",
+                 "quality_grade", "latitude", "longitude"],
+        filters=[("taxon_id", "==", TAXON_ID)],
+    ).sort_values("photo_id").reset_index(drop=True)
     print(f"  {len(df):,} photos found in {time.time() - t0:.3f}s")
     if df.empty:
         raise SystemExit(f"No research-grade photos found for taxon_id={TAXON_ID}.")
