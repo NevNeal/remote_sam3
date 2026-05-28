@@ -9,3 +9,4 @@ numpy==2.4.4
 urllib3==2.3.0
 safetensors==0.7.0
 tokenizers==0.22.2
+duckdb==1.5.3
