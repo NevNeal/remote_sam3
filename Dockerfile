@@ -7,11 +7,14 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+    --trusted-host pypi.org \
+    --trusted-host files.pythonhosted.org \
+    -r requirements.txt
 
 COPY segmentation_pipeline.py test_on_chtc.py ./
 
-# No ENTRYPOINT — the caller specifies the command. Examples:
+# No ENTRYPOINT - the caller specifies the command. Examples:
 #   docker run --gpus all -e HF_TOKEN=hf_... remote_sam3 \
 #       python segmentation_pipeline.py 591507 output --limit 1
 #   docker run --gpus all -e HF_TOKEN=hf_... remote_sam3 \
