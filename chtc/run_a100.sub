@@ -5,9 +5,9 @@
 # whole taxon, and ships results straight to Research Drive via output_destination.
 #
 # Before submitting:
-#   1. Edit `netid` below to your CHTC username.
+#   1. `netid` is set to nneal3 (staging path /staging/n/nneal3).
 #   2. Make sure inat_photos.parquet is in your /staging dir:
-#        /staging/u/<netid>/inat_photos.parquet
+#        /staging/n/nneal3/inat_photos.parquet
 #   3. export HF_TOKEN=hf_...   (getenv passes it into the job)
 #
 # Submit:
@@ -15,7 +15,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── EDIT ME ──────────────────────────────────────────────────────────────────
-netid = REPLACE_WITH_YOUR_NETID
+netid = nneal3
 
 # ── Container ────────────────────────────────────────────────────────────────
 container_image = docker://nevneal/remote_sam3:latest
@@ -45,7 +45,7 @@ when_to_transfer_output = ON_EXIT
 
 # Parquet (~3.9 GB, in the 1–30 GB band) comes from /staging over OSDF and lands
 # as ./inat_photos.parquet in the job scratch dir.
-transfer_input_files  = chtc/staging_pipeline.py, chtc/run_staging.sh, osdf:///chtc/staging/u/$(netid)/inat_photos.parquet
+transfer_input_files  = chtc/staging_pipeline.py, chtc/run_staging.sh, osdf:///chtc/staging/n/$(netid)/inat_photos.parquet
 transfer_output_files = a100_160559_flower
 
 # Send the output directory to Research Drive (per-GPU subfolder under aster_test).
