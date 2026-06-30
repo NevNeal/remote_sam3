@@ -1,0 +1,67 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Single A100 staging job — taxon 62741, prompt "petal".
+#
+# Reads the iNat parquet index from /staging (delivered via OSDF), segments the
+# whole taxon, and ships results straight to Research Drive via output_destination.
+#
+# Before submitting:
+#   1. `netid` is set to nneal3 (staging path /staging/n/nneal3).
+#   2. Make sure inat_photos.parquet is in your /staging dir:
+#        /staging/n/nneal3/inat_photos.parquet
+#      NOTE: the staging pipeline filters the parquet by an EXACT taxon_id match
+#      (taxon_id == 62741). Confirm the parquet actually contains rows labeled
+#      with taxon_id 62741 at that granularity, or the job exits with
+#      "No research-grade photos found for taxon_id=62741."
+#   3. export HF_TOKEN=hf_...   (getenv passes it into the job)
+#
+# Submit:
+#   condor_submit chtc/run_a100_petal_62741.sub
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── EDIT ME ──────────────────────────────────────────────────────────────────
+netid = nneal3
+
+# ── Container ────────────────────────────────────────────────────────────────
+container_image = docker://nevneal/remote_sam3:latest
+
+# ── Executable ───────────────────────────────────────────────────────────────
+# args: <taxon_id> <output_dir> <prompt> <parquet>
+executable = chtc/run_staging.sh
+arguments  = 62741 a100_62741_petal petal inat_photos.parquet
+
+# ── GPU: A100 (compute capability 8.0) ───────────────────────────────────────
++WantGPULab             = true
++GPUJobLength           = "long"
+request_gpus            = 1
+gpus_minimum_capability = 8.0
+gpus_maximum_capability = 8.0
+gpus_minimum_memory     = 39000
+
+request_cpus   = 4
+request_memory = 32GB
+request_disk   = 100GB
+
+# ── Environment ──────────────────────────────────────────────────────────────
+getenv = HF_TOKEN
+
+# ── File transfer ────────────────────────────────────────────────────────────
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+
+# Parquet (~3.9 GB, in the 1–30 GB band) comes from /staging over OSDF and lands
+# as ./inat_photos.parquet in the job scratch dir.
+transfer_input_files  = chtc/staging_pipeline.py, chtc/run_staging.sh, osdf:///chtc/staging/n/$(netid)/inat_photos.parquet
+transfer_output_files = a100_62741_petal
+
+# Send the output directory to Research Drive (per-run subfolder under aster_test).
+output_destination = pelican://chtc.wisc.edu/researchdrive/dli55/CHTC/aster_test
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+log    = logs/a100_petal_62741.$(Cluster).$(Process).log
+output = logs/a100_petal_62741.$(Cluster).$(Process).out
+error  = logs/a100_petal_62741.$(Cluster).$(Process).err
+
+on_exit_hold        = (ExitCode != 0)
+on_exit_hold_reason = "A100 petal/62741 job exited non-zero"
+
+queue 1
