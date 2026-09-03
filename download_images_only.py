@@ -163,6 +163,29 @@ def best_original_photo_url(photo: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def api_original_photo_url(photo: Dict[str, Any]) -> Optional[str]:
+    """Original-size URL on static.inaturalist.org.
+
+    Used as a fallback: photos whose license keeps them out of the S3
+    open-data mirror return 404 there but are still served by iNat itself.
+    """
+    api_original = photo.get("original_url")
+
+    if api_original:
+        return api_original
+
+    api_url = photo.get("url")
+
+    if not api_url:
+        return None
+
+    for token in ["square", "small", "medium", "large"]:
+        if f"/{token}." in api_url:
+            return api_url.replace(f"/{token}.", "/original.")
+
+    return api_url
+
+
 def infer_image_ext_from_url(url: str) -> str:
     if not isinstance(url, str) or not url:
         return "jpg"
@@ -213,6 +236,7 @@ METADATA_COLUMNS = [
     "photo_width",
     "photo_height",
     "photo_url_original",
+    "photo_url_fallback",
     "photo_index",
     "image_filename",
 ]
@@ -273,6 +297,7 @@ def rows_from_obs(obs: Dict[str, Any]):
             "photo_width": photo.get("width"),
             "photo_height": photo.get("height"),
             "photo_url_original": url,
+            "photo_url_fallback": api_original_photo_url(photo),
             "photo_index": index,
             "image_filename": build_filename(obs.get("id"), index, url),
         })
@@ -396,7 +421,8 @@ def download_image_bytes(session: requests.Session, url: str) -> bytes:
 def download_all_images(session: requests.Session, rows, out_dir: str,
                         max_workers: int, limit: Optional[int],
                         error_log: str):
-    todo = [row for row in rows if row.get("photo_url_original")]
+    todo = [row for row in rows
+            if row.get("photo_url_original") or row.get("photo_url_fallback")]
 
     if limit is not None:
         todo = todo[:limit]
@@ -413,13 +439,24 @@ def download_all_images(session: requests.Session, rows, out_dir: str,
         if SKIP_IF_EXISTS and os.path.exists(image_path) and os.path.getsize(image_path) > 0:
             return ("exists", row, None)
 
-        try:
-            data = download_image_bytes(session, str(row["photo_url_original"]))
-            write_bytes_atomic(image_path, data)
-            return ("downloaded", row, None)
+        candidates = [row.get("photo_url_original"), row.get("photo_url_fallback")]
+        urls = [url for url in candidates if url]
 
-        except Exception as error:
-            return ("failed", row, str(error))
+        # de-duplicate while keeping order
+        urls = list(dict.fromkeys(urls))
+
+        last_error = None
+
+        for url in urls:
+            try:
+                data = download_image_bytes(session, str(url))
+                write_bytes_atomic(image_path, data)
+                return ("downloaded", row, None)
+
+            except Exception as error:
+                last_error = error
+
+        return ("failed", row, str(last_error))
 
     progress = tqdm(total=len(todo), desc="Download originals", dynamic_ncols=True)
 
