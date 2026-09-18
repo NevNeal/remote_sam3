@@ -48,7 +48,9 @@ print("python       :", __import__("sys").version.split()[0])
 print("torch        :", torch.__version__)
 print("torch cuda   :", torch.version.cuda)
 print("transformers :", transformers.__version__)
-arches = torch.cuda.get_arch_list()
+# Not torch.cuda.get_arch_list(): it returns [] whenever no GPU is visible,
+# which is always the case on a login node. The flags it wraps are compiled in.
+arches = (torch._C._cuda_getArchFlags() or "").split()
 print("arch_list    :", arches)
 assert "sm_89" in arches, "sm_89 missing — this build will NOT run on the L4s"
 assert any(a.endswith("_100") for a in arches), \
