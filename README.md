@@ -31,14 +31,14 @@ not a port.
 
 | column | example |
 |---|---|
-| `taxon_id` | `160559` |
-| `photo_id` | `95238471` |
+| `taxon_id` | `62741` |
+| `photo_id` | `50805` |
 | `extension` | `jpeg` |
-| `taxon_name` | `Symphyotrichum novae-angliae` |
+| `taxon_name` | `Rudbeckia hirta` |
 | `quality_grade` | `research` |
-| `latitude` / `longitude` | `42.3`, `-71.1` |
+| `latitude` / `longitude` | `42.15`, `-71.65` |
 
-259 million rows, ~3.9 GB. The photo URL isn't stored, because it doesn't need
+289 million rows, 4.6 GB (from the 2026-08-27 dumps). The photo URL isn't stored, because it doesn't need
 to be — it's two columns glued together:
 
 ```
@@ -52,7 +52,7 @@ joins them, keeps research-grade rows only, and writes the parquet.
 **Why bother.** The alternative is the iNaturalist REST API, which is paginated
 and rate-limited: ~20 minutes of careful paging to enumerate one large taxon, and
 the whole thing falls over if you run 60 workers against it at once. A filtered
-parquet read is **~4 seconds**, needs no network, no token, and no politeness
+parquet read is **under a second**, needs no network, no token, and no politeness
 budget. Sixty shards can each read it simultaneously because it's a read-only
 file on Lustre.
 
@@ -102,6 +102,11 @@ fair mix of the good and the bad. Interleaving guarantees that.
   every filename contains a unique `photo_id`, so two shards can never write the
   same file. When the array finishes you have one complete output tree, not 60
   partial ones to stitch together.
+- **Duplicate photos are dropped before sharding.** iNat's dumps contain ~0.1%
+  byte-identical duplicate photo rows. Left alone, the two copies get different
+  `row_index` values, land in *different* shards, and those shards segment the
+  same photo and write the same filenames concurrently. `segment.py` de-duplicates
+  on `photo_id` before `row_index` is assigned, and reports how many it dropped.
 - **The shard count must stay the same across reruns**, because it's what defines
   who owns which row. Change it and the row→shard mapping changes underneath you.
   `slurm/array.sbatch` reads it from `SLURM_ARRAY_TASK_COUNT` so it can't drift;

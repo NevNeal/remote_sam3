@@ -91,6 +91,17 @@ def load_photos(parquet, taxon_id, limit, shard, num_shards):
 
     if df.empty:
         raise SystemExit(f"No research-grade photos for taxon_id={taxon_id}.")
+
+    # iNat's own dumps contain ~0.1% byte-identical duplicate photo rows, so the
+    # index inherits them. Left in place they are worse than merely wasteful: the
+    # two copies get different row_index values, land in DIFFERENT shards, and
+    # those two shards then segment the same photo and write the same mask and
+    # overlay filenames concurrently. Dedupe before row_index is assigned.
+    duplicates = int(df["photo_id"].duplicated().sum())
+    if duplicates:
+        df = df.drop_duplicates(subset=["photo_id"]).reset_index(drop=True)
+        print(f"           : dropped {duplicates:,} duplicate photo_id rows")
+
     if limit:
         df = df.head(limit).copy()
 

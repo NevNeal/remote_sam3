@@ -12,9 +12,15 @@ The image URL is not stored, because it is derivable:
 
     https://inaturalist-open-data.s3.amazonaws.com/photos/{photo_id}/original.{extension}
 
-Result: ~259M rows, ~3.9 GB. A filtered read for one taxon takes ~4 seconds,
-versus ~20 minutes of paging the iNaturalist API against its rate limits. That
-speed is the entire reason the index exists.
+Result: ~289M rows, ~4.6 GB (2026-08 dumps). A filtered read for one taxon takes
+well under a second, versus ~20 minutes of paging the iNaturalist API against its
+rate limits. That speed is the entire reason the index exists.
+
+Note on duplicates: iNat's dumps contain ~0.1% byte-identical duplicate photo
+rows, so the index inherits them. They are NOT de-duplicated here -- a DISTINCT
+over 289M rows is an expensive extra pass, and the index is meant to mirror the
+source. segment.py drops them per-taxon at read time instead, which is where it
+matters, because the two copies would otherwise be assigned to different shards.
 
     python build_index.py --data-dir /blue/GROUP/USER/data
 
