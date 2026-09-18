@@ -9,3 +9,8 @@ design_doc.md
 
 # iNat open-data files (large)
 inat_db/data/
+
+# local annotation CSVs (large, live on blue)
+data/*.csv
+data/*.csv.gz
+.DS_Store
