@@ -12,6 +12,7 @@ build_index.py     make the metadata index (once, then monthly)
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
 run_metrics.py     detailed timing, GPU, detection and cost metrics for a run
+tests/             pytest: parquet -> shard rows -> S3 download, no GPU needed
 setup_env.sh       create the conda env from environment.yml, cache the model
 environment.yml    the HiPerGator conda env: python 3.12 + torch cu128 + pins
 requirements.txt   pip packages, pinned (pulled in by environment.yml)
@@ -521,6 +522,23 @@ Three things differ from a taxon run:
 
 `quality_grade`, `latitude` and `longitude` are blank in the results CSV — the
 annotation file does not carry them.
+
+## Tests
+
+`tests/` covers the download path: reading a shard's rows out of the parquet
+index (`load_photos`) and fetching them from the open-data bucket (`fetch`,
+`make_session`). No GPU or model is needed; torch and transformers are stubbed
+if missing, so this runs on a login node or a laptop.
+
+```bash
+pip install pytest                                   # once, into the sam3 env
+pytest                                               # all, incl. ~10 live S3 GETs
+pytest -m "not network"                              # offline only
+INAT_PARQUET=data/inat_photos.parquet pytest -m real_index   # check the built index
+```
+
+The fixture index is generated at test time in `build_index.py`'s schema, from
+six real California poppy photos (two stored as `.jpeg`) plus synthetic rows.
 
 ## 7. Open items
 
