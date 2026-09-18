@@ -43,7 +43,7 @@ set +u; conda activate "${CONDA_ENV}"; set -u    # conda's activate scripts trip
 echo
 echo "── verification ─────────────────────────────────────────────────────────"
 python - <<'PY'
-import torch, transformers
+import re, torch, transformers
 print("python       :", __import__("sys").version.split()[0])
 print("torch        :", torch.__version__)
 print("torch cuda   :", torch.version.cuda)
@@ -52,9 +52,18 @@ print("transformers :", transformers.__version__)
 # which is always the case on a login node. The flags it wraps are compiled in.
 arches = (torch._C._cuda_getArchFlags() or "").split()
 print("arch_list    :", arches)
-assert "sm_89" in arches, "sm_89 missing — this build will NOT run on the L4s"
-assert any(a.endswith("_100") for a in arches), \
-    "sm_100 missing — this build will NOT run on hpg-b200"
+
+# Code built for sm_XY runs on any GPU with the same major version X and minor
+# >= Y, so PyTorch ships sm_86 and no separate sm_89: the L4 runs the sm_86 code.
+def runs_on(major, minor):
+    for a in arches:
+        m = re.fullmatch(r"sm_(\d+?)(\d)a?", a)
+        if m and int(m[1]) == major and int(m[2]) <= minor:
+            return True
+    return False
+
+assert runs_on(8, 9), "no sm_8x <= sm_89 — this build will NOT run on the L4s"
+assert runs_on(10, 0), "no sm_100 — this build will NOT run on hpg-b200"
 print("L4 (sm_89) and B200 (sm_100) both supported")
 # A login node has no GPU, so is_available() is expected to be False here.
 # The jobs print the GPU they land on.
