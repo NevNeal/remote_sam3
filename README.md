@@ -11,6 +11,7 @@ Docker, no containers, no file staging.
 build_index.py     make the metadata index (once, then monthly)
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
+run_metrics.py     detailed timing, GPU, detection and cost metrics for a run
 setup_env.sh       create the conda env from environment.yml, cache the model
 environment.yml    the HiPerGator conda env: python 3.12 + torch cu128 + pins
 requirements.txt   pip packages, pinned (pulled in by environment.yml)
@@ -495,6 +496,7 @@ Then:
 sbatch --array=0-4 slurm/local.sbatch          # 5 GPUs, first 5,000 images
 LIMIT= sbatch --array=0-59 slurm/local.sbatch  # no limit: all 2.8M
 python collect.py results/local_flower --num-shards 5
+python run_metrics.py results/local_flower      # stage timing, GPU busy %, projection
 ```
 
 `IMAGE_ROOT` in `slurm/settings.sh` is what the index's leading `data/` maps to,
