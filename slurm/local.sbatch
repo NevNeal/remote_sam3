@@ -31,6 +31,10 @@
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
+# settings.sh fills OUT_DIR with the taxon default (results/<taxon>_<prompt>),
+# so an OUT_DIR default set after sourcing it would never apply. Keep only one
+# the caller passed in explicitly.
+caller_out_dir="${OUT_DIR:-}"
 source slurm/settings.sh
 
 export SHARD="$SLURM_ARRAY_TASK_ID"
@@ -38,6 +42,6 @@ export NUM_SHARDS="${NUM_SHARDS:-$SLURM_ARRAY_TASK_COUNT}"
 export LOCAL_INDEX="${LOCAL_INDEX:-${PROJECT}/data/local_image_paths.parquet}"
 export IMAGE_ROOT="${IMAGE_ROOT}"
 export LIMIT="${LIMIT-5000}"        # LIMIT= (empty) means the whole index
-export OUT_DIR="${OUT_DIR:-${RESULTS}/local_${PROMPT// /_}}"
+export OUT_DIR="${caller_out_dir:-${RESULTS}/local_${PROMPT// /_}}"
 
 bash "$SLURM_SUBMIT_DIR/slurm/run_shard.sh"
