@@ -30,4 +30,5 @@ dependencies:
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.9.1+cu128
+      - torchvision==0.24.1+cu128    # Sam3ImageProcessor needs it; 0.24.x pairs with torch 2.9.x
       - -r requirements.txt

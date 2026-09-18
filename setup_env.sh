@@ -13,7 +13,7 @@
 #    network for the model
 #
 # Takes ~15 minutes, almost all of it downloading wheels. Safe to rerun: an
-# existing env is kept, and a warm cache is a no-op.
+# existing env is updated from environment.yml, and a warm cache is a no-op.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -30,8 +30,11 @@ export CONDA_PKGS_DIRS="${PROJECT}/.conda/pkgs"
 export PIP_NO_CACHE_DIR=1
 
 if [[ -d "${CONDA_ENV}/conda-meta" ]]; then
-    echo "[env] ${CONDA_ENV} already exists — keeping it"
-    echo "      (to rebuild: conda env remove -p ${CONDA_ENV} && ./setup_env.sh)"
+    # Bring an existing env up to date with environment.yml. Already-satisfied
+    # pins are a no-op, so this is quick and picks up anything newly added.
+    echo "[env] ${CONDA_ENV} exists — updating it from environment.yml"
+    echo "      (to rebuild from scratch: conda env remove -p ${CONDA_ENV} && ./setup_env.sh)"
+    conda env update -f environment.yml -p "${CONDA_ENV}"
 else
     echo "[env] creating ${CONDA_ENV} from environment.yml"
     conda env create -f environment.yml -p "${CONDA_ENV}"
@@ -43,10 +46,11 @@ set +u; conda activate "${CONDA_ENV}"; set -u    # conda's activate scripts trip
 echo
 echo "── verification ─────────────────────────────────────────────────────────"
 python - <<'PY'
-import re, torch, transformers
+import re, torch, torchvision, transformers
 print("python       :", __import__("sys").version.split()[0])
 print("torch        :", torch.__version__)
 print("torch cuda   :", torch.version.cuda)
+print("torchvision  :", torchvision.__version__)
 print("transformers :", transformers.__version__)
 # Not torch.cuda.get_arch_list(): it returns [] whenever no GPU is visible,
 # which is always the case on a login node. The flags it wraps are compiled in.

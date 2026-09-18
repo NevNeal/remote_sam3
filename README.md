@@ -321,7 +321,8 @@ What `setup_env.sh` does, in order:
    parallel shards make zero HuggingFace requests. N simultaneous 3 GB pulls
    would get throttled.
 
-It is safe to rerun: an existing env is kept, and a warm cache is a no-op. To
+It is safe to rerun: an existing env is updated to match `environment.yml`
+(a no-op if nothing changed), and a warm cache is a no-op. To
 rebuild from scratch: `conda env remove -p .conda/sam3 && ./setup_env.sh`.
 
 To use the env interactively (e.g. on a login node or in an `srun` session):
