@@ -11,11 +11,25 @@ Docker, no containers, no file staging.
 build_index.py     make the metadata index (once, then monthly)
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
-setup_env.sh       create the conda env, install torch, cache the model
-environment.yml    conda env definition
-requirements.txt   pip packages, pinned
+setup_env.sh       create the conda env from environment.yml, cache the model
+environment.yml    the HiPerGator conda env: python 3.12 + torch cu128 + pins
+requirements.txt   pip packages, pinned (pulled in by environment.yml)
 slurm/settings.sh  ← THE ONLY FILE YOU EDIT
-slurm/*.sbatch     the three jobs: build_index, test, array
+slurm/run_shard.sh one shard on one GPU — what every GPU job runs
+slurm/*.sbatch     the jobs: test (1 GPU), test_2gpu (2 GPUs), array (N GPUs),
+                   build_index (CPU)
+```
+
+On HiPerGator it lives in `flower_sam3/`, and everything it creates stays
+inside that directory:
+
+```
+flower_sam3/
+├── data/inat_photos.parquet     the index
+├── .conda/sam3/                 the conda env      (setup_env.sh)
+├── hf_cache/                    SAM3 weights       (setup_env.sh)
+├── results/<taxon>_<prompt>/    run outputs        (the jobs)
+└── logs/                        SLURM .out/.err    (the jobs)
 ```
 
 The CHTC/HTCondor version of this project lives on the `main` branch. It is a
@@ -250,46 +264,86 @@ you where the time actually goes.
 
 ## 5. Setup
 
-Once, on a HiPerGator login node.
+Once, on a HiPerGator **login node**. About 15 minutes, almost all of it pip
+downloading wheels.
+
+### Step 1 — put the code in `flower_sam3`
+
+`flower_sam3/` already exists and holds `data/`, so turn it into a checkout in
+place rather than cloning into a new folder (git won't clone into a non-empty
+directory). `data/`, `results/`, `hf_cache/`, `.conda/` and `logs/*` are all
+gitignored, so git never touches them.
 
 ```bash
-# 1. Get the code onto /blue
-ssh <gatorlink>@hpg.rc.ufl.edu
-mkdir -p /blue/<group>/$USER && cd /blue/<group>/$USER
-git clone -b hipergator https://github.com/NevNeal/remote_sam3.git
-cd remote_sam3 && mkdir -p logs
+ssh neal.nevyn@hpg.rc.ufl.edu
+cd ~/blue_guralnick/neal.nevyn/flower_sam3
+git init
+git remote add origin https://github.com/NevNeal/remote_sam3.git
+git fetch origin
+git checkout flower-sam3
+ls data/          # the parquet should be data/inat_photos.parquet
+```
 
-# 2. Edit slurm/settings.sh — set GROUP. That is the only required change.
+If the parquet has a different name, set `PARQUET` in `slurm/settings.sh`. No
+other edits are needed: every path is relative to `flower_sam3/`, so nothing
+depends on your group name.
 
-# 3. Build the environment (~15 min). HF_TOKEN is needed because
-#    facebook/sam3 is a gated repo.
-export HF_TOKEN=hf_...
+Later updates are just `git pull`.
+
+### Step 2 — build the conda environment
+
+```bash
+export HF_TOKEN=hf_...        # huggingface.co/settings/tokens; facebook/sam3 is gated
 ./setup_env.sh
 ```
 
-`setup_env.sh` creates the `sam3` conda env, installs torch from the cu128 index,
-installs `requirements.txt`, verifies `sm_100` support, and pre-downloads the SAM3
-weights into `$HF_HOME` on `/blue`. Jobs then run with `HF_HUB_OFFLINE=1` — 60
-concurrent shards cause zero HuggingFace traffic, which matters because 60
-simultaneous 3 GB model pulls would get you throttled.
+What `setup_env.sh` does, in order:
 
-HiPerGator points conda's `envs_dirs` at `/blue/<group>/<user>/.conda/envs` on the
-first `module load conda`, so the environment lands on Lustre rather than eating
-your 40 GB `$HOME` quota.
+1. **`module load conda`.** HiPerGator's conda comes as a module; there is
+   nothing to install yourself.
+2. **`conda env create -f environment.yml -p .conda/sam3`.** That creates the
+   environment as a folder inside the project rather than a named env in
+   `$HOME`. `$HOME` is capped at 40 GB and this env is ~8 GB. Conda's package
+   cache is also pointed inside the project, and pip's cache is switched off.
+   `environment.yml` is the whole definition:
+   - conda: Python 3.12 and pip, nothing else
+   - pip: `torch==2.9.1+cu128` from PyTorch's CUDA 12.8 index, then
+     `requirements.txt` (transformers, pandas, pyarrow, … at the versions
+     proven against SAM3)
 
-### Getting the index in place
+   The torch wheel carries its own CUDA runtime, so there is no
+   `module load cuda`; all it needs is the NVIDIA driver on the GPU node.
+3. **A build check.** It asserts torch was compiled for `sm_89` (the L4s) and
+   `sm_100` (the B200s), so a bad build fails here and not in a queued job.
+   `gpu here: False` is expected, because login nodes have no GPU.
+4. **A model-cache warm-up.** It downloads the SAM3 weights (~3 GB) once into
+   `hf_cache/`. Jobs run with `HF_HUB_OFFLINE=1` and read from there, so N
+   parallel shards make zero HuggingFace requests. N simultaneous 3 GB pulls
+   would get throttled.
 
-You already have `inat_photos.parquet` locally, so copy it up — much faster than
-rebuilding:
+It is safe to rerun: an existing env is kept, and a warm cache is a no-op. To
+rebuild from scratch: `conda env remove -p .conda/sam3 && ./setup_env.sh`.
+
+To use the env interactively (e.g. on a login node or in an `srun` session):
 
 ```bash
-# from your workstation
-scp inat_db/data/inat_photos.parquet \
-    <gatorlink>@hpg.rc.ufl.edu:/blue/<group>/<user>/data/
+module load conda
+conda activate ./.conda/sam3          # from flower_sam3/
 ```
 
-Or build it on HiPerGator from scratch, which is what you want for the monthly
-refresh so the 28 GB never touches your laptop:
+To try the GPU by hand before submitting anything:
+
+```bash
+srun -p hpg-turin --gpus=1 --cpus-per-task=4 --mem=16gb --time=00:20:00 --pty bash -i
+module load conda && conda activate ./.conda/sam3
+python -c "import torch; print(torch.cuda.get_device_name(0))"     # NVIDIA L4
+```
+
+### Rebuilding the index
+
+The index is already in `data/`. For the monthly refresh, when iNat
+republishes the dumps, build it on HiPerGator so the 28 GB of CSVs never touch
+your laptop:
 
 ```bash
 sbatch slurm/build_index.sbatch      # ~4-8 hours, no GPU
@@ -299,17 +353,47 @@ sbatch slurm/build_index.sbatch      # ~4-8 hours, no GPU
 
 ## 6. Running
 
+Always from `flower_sam3/`. There are three steps, each a bigger version of the
+one before:
+
 ```bash
-sbatch slurm/test.sbatch                            # 1 L4, 100 images — always first
-sbatch --array=0-59 slurm/array.sbatch              # the real run
+sbatch slurm/test.sbatch              # 1 L4, 100 images: does anything work?
+sbatch slurm/test_2gpu.sbatch         # 2 L4s at once, 200 images: does it parallelise?
+sbatch --array=0-59 slurm/array.sbatch   # the real run, 60 L4s
 squeue -u $USER
-python collect.py /blue/<group>/<user>/results/160559_flower --num-shards 60
+python collect.py results/160559_flower --num-shards 60
 ```
+
+All three GPU jobs run the same `slurm/run_shard.sh`, so they differ only in
+width and image count. `test_2gpu.sbatch` is `array.sbatch` at `--array=0-1`
+with `LIMIT=200`.
+
+### Checking the 2-GPU test
+
+Each array task is its own 1-GPU job. SLURM may put both tasks on one node (an
+`hpg-turin` node has three L4s) or on two nodes; the shards never talk to each
+other, so either is fine. A pass looks like this:
+
+```bash
+sacct -j <jobid> --format=JobID,NodeList,Start,End,Elapsed,State
+#   <jobid>_0 and <jobid>_1 both COMPLETED, Start/End windows overlapping
+
+grep -h -E '^(shard|node|gpu|started|finished)' logs/sam3_2gpu-<jobid>_*.out
+#   two different GPU UUIDs
+
+python collect.py results/160559_flower_test2gpu --num-shards 2
+#   200 photos, shards 0 and 1 both present, no duplicates
+```
+
+If one task sat `PENDING` while the other ran, SLURM still did its job, but you
+haven't tested parallelism yet. That usually means your group's GPU allocation
+is saturated (`slurmInfo` shows it).
 
 Different taxon or prompt, no file edits needed:
 
 ```bash
 TAXON_ID=62741 PROMPT=petal sbatch --array=0-39 slurm/array.sbatch
+LIMIT=1000 sbatch slurm/test_2gpu.sbatch       # bigger parallel test
 ```
 
 ### Output
@@ -346,15 +430,16 @@ GB of PNGs. Move finished runs to `/orange` if your group has an investment
 cluster:
 
 ```bash
-rsync -ah --info=progress2 /blue/<group>/<user>/results/160559_flower/ \
-                           /orange/<group>/<user>/sam3/160559_flower/
+rsync -ah --info=progress2 results/160559_flower/ \
+                           /orange/<group>/$USER/sam3/160559_flower/
 ```
 
 ---
 
 ## 7. Open items
 
-- **`GROUP` in `slurm/settings.sh` is `CHANGEME`** — the one thing blocking a run.
+- Run `slurm/test_2gpu.sbatch` to confirm two L4s run shards side by side,
+  before widening the array.
 - Group GPU allocation unverified. Run `slurmInfo` before going past ~20
   concurrent shards.
 - `--cpus-per-task` / `WORKERS` are conservative first guesses against

@@ -1,15 +1,33 @@
-# Conda environment for remote_sam3 on HiPerGator.
+# HiPerGator conda environment for flower_sam3.
 #
-# Conda's only job here is to give us a clean Python 3.12 on /blue. Everything
-# else comes from pip (see requirements.txt) because PyTorch has to be pulled
-# from PyTorch's own cu128 wheel index, and because the package versions below
-# are the exact set already proven to work with facebook/sam3.
+# One file builds the whole environment:
 #
-# Do not `conda env create -f` this by hand — run ./setup_env.sh, which creates
-# the env and then installs torch and requirements.txt in the right order.
+#     module load conda
+#     conda env create -f environment.yml -p ./.conda/sam3
+#
+# but use ./setup_env.sh, which does exactly that plus the GPU check and the
+# SAM3 weight download. README "Setup" walks through it.
+#
+# Conda supplies Python 3.12 and pip; everything else is pip, because:
+#
+#   - PyTorch has to come from PyTorch's own CUDA 12.8 wheel index. HiPerGator's
+#     B200s are Blackwell (sm_100) and CUDA 12.8 is the first toolkit that can
+#     target them; the cu128 build also covers the L4s (sm_89). The "+cu128"
+#     pin makes pip take that wheel rather than whatever PyPI's default is.
+#     The wheel bundles its own CUDA runtime — no `module load cuda` needed,
+#     only the node's NVIDIA driver.
+#   - requirements.txt holds the exact versions already proven against
+#     facebook/sam3. It is read from the same directory as this file.
+#
+# The `name:` below is only used if you create the env by name (-n) instead of
+# by path (-p); setup_env.sh uses a path inside the project.
 name: sam3
 channels:
   - conda-forge
 dependencies:
   - python=3.12
   - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.9.1+cu128
+      - -r requirements.txt

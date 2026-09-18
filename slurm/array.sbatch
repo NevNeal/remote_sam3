@@ -5,6 +5,8 @@
 #     sbatch --array=0-59 slurm/array.sbatch          # 60 shards, all at once
 #     sbatch --array=0-299%40 slurm/array.sbatch      # 300 shards, 40 at a time
 #
+# Run slurm/test_2gpu.sbatch first — it is this same job at width 2.
+#
 # num_shards is read from SLURM_ARRAY_TASK_COUNT, so the array size IS the shard
 # count and the two can never drift apart. The one exception is rerunning a
 # subset, where the count would be wrong — pass it explicitly then:
@@ -30,35 +32,10 @@
 #SBATCH --error=logs/%x-%A_%a.err
 
 set -euo pipefail
-cd "$SLURM_SUBMIT_DIR"
-source slurm/settings.sh
 
 # SLURM_ARRAY_TASK_COUNT is the number of tasks in this array. Correct for
 # 0-59 and for 0-299%40 alike; wrong only for a partial rerun, hence the override.
-NUM_SHARDS="${NUM_SHARDS:-$SLURM_ARRAY_TASK_COUNT}"
-SHARD="$SLURM_ARRAY_TASK_ID"
+export SHARD="$SLURM_ARRAY_TASK_ID"
+export NUM_SHARDS="${NUM_SHARDS:-$SLURM_ARRAY_TASK_COUNT}"
 
-module purge
-module load conda
-conda activate "$CONDA_ENV"
-
-export HF_HUB_OFFLINE=1          # weights are pre-cached by setup_env.sh
-# Without this, every shard's BLAS spawns a thread per core on the node and
-# three shards sharing an hpg-turin node thrash each other.
-export OMP_NUM_THREADS="$SLURM_CPUS_PER_TASK"
-
-echo "shard $SHARD of $NUM_SHARDS on $(hostname)"
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-date
-
-python segment.py \
-    --taxon-id   "$TAXON_ID" \
-    --parquet    "$PARQUET" \
-    --out        "$OUT_DIR" \
-    --prompt     "$PROMPT" \
-    --min-score  "$MIN_SCORE" \
-    --workers    "$WORKERS" \
-    --shard      "$SHARD" \
-    --num-shards "$NUM_SHARDS"
-
-date
+bash "$SLURM_SUBMIT_DIR/slurm/run_shard.sh"

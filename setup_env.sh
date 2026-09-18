@@ -1,15 +1,19 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# One-time environment setup. Run on a HiPerGator LOGIN node.
+# One-time environment setup. Run on a HiPerGator LOGIN node, from the project
+# root (the flower_sam3 checkout).
 #
 #   export HF_TOKEN=hf_...        # facebook/sam3 is a gated repo
 #   ./setup_env.sh
 #
-# Creates the `sam3` conda env, installs PyTorch for CUDA 12.8, installs
-# requirements.txt, and pre-downloads the SAM3 weights into a shared cache so
-# that jobs never touch the network for the model.
+# 1. creates the conda env from environment.yml at ./.conda/sam3
+#    (Python 3.12, torch 2.9.1+cu128, requirements.txt)
+# 2. checks torch was built for the GPUs HiPerGator has
+# 3. pre-downloads the SAM3 weights into ./hf_cache so jobs never touch the
+#    network for the model
 #
-# Takes ~15 minutes, almost all of it downloading wheels.
+# Takes ~15 minutes, almost all of it downloading wheels. Safe to rerun: an
+# existing env is kept, and a warm cache is a no-op.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -20,53 +24,46 @@ source slurm/settings.sh
 module purge
 module load conda
 
-# HiPerGator points envs_dirs/pkgs_dirs at /blue/<group>/<user>/.conda on the
-# first `module load conda`, so envs land on Lustre and not in your 40 GB $HOME.
-echo "── conda storage locations ───────────────────────────────────────────────"
-conda config --show envs_dirs pkgs_dirs
+# $HOME is 40 GB. Keep conda's package cache inside the project and skip pip's
+# cache entirely (torch + its CUDA libraries are ~4 GB of wheels).
+export CONDA_PKGS_DIRS="${PROJECT}/.conda/pkgs"
+export PIP_NO_CACHE_DIR=1
 
-if conda env list | grep -qE "^${CONDA_ENV}\s"; then
-    echo "[env] '${CONDA_ENV}' already exists — skipping create (delete it to rebuild:"
-    echo "      conda env remove -n ${CONDA_ENV} )"
+if [[ -d "${CONDA_ENV}/conda-meta" ]]; then
+    echo "[env] ${CONDA_ENV} already exists — keeping it"
+    echo "      (to rebuild: conda env remove -p ${CONDA_ENV} && ./setup_env.sh)"
 else
-    echo "[env] creating '${CONDA_ENV}' from environment.yml"
-    conda env create -f environment.yml -n "${CONDA_ENV}"
+    echo "[env] creating ${CONDA_ENV} from environment.yml"
+    conda env create -f environment.yml -p "${CONDA_ENV}"
 fi
 
 # shellcheck disable=SC1091
-conda activate "${CONDA_ENV}"
-
-# PyTorch FIRST, from PyTorch's cu128 index.
-#
-# Why cu128 specifically: HiPerGator's large GPUs are B200 (Blackwell, compute
-# capability sm_100). CUDA 12.8 is the first toolkit that can emit sm_100 code,
-# and torch 2.7 was the first release with cu128 wheels. A cu124 build fails on
-# a B200 with "no kernel image is available for execution on the device". The
-# cu128 build still covers sm_75 and sm_89, so one install runs on the L4s too.
-echo "[env] installing torch (cu128)"
-pip install --no-cache-dir torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-
-# Everything else from PyPI. Installed second so nothing drags in a cu126 torch.
-echo "[env] installing requirements.txt"
-pip install --no-cache-dir -r requirements.txt
+set +u; conda activate "${CONDA_ENV}"; set -u    # conda's activate scripts trip over set -u
 
 echo
 echo "── verification ─────────────────────────────────────────────────────────"
 python - <<'PY'
-import torch
+import torch, transformers
+print("python       :", __import__("sys").version.split()[0])
 print("torch        :", torch.__version__)
 print("torch cuda   :", torch.version.cuda)
-print("arch_list    :", torch.cuda.get_arch_list())
-assert any(a.endswith("_100") for a in torch.cuda.get_arch_list()), \
+print("transformers :", transformers.__version__)
+arches = torch.cuda.get_arch_list()
+print("arch_list    :", arches)
+assert "sm_89" in arches, "sm_89 missing — this build will NOT run on the L4s"
+assert any(a.endswith("_100") for a in arches), \
     "sm_100 missing — this build will NOT run on hpg-b200"
-print("sm_100 present — B200-capable")
+print("L4 (sm_89) and B200 (sm_100) both supported")
+# A login node has no GPU, so is_available() is expected to be False here.
+# The jobs print the GPU they land on.
+print("gpu here     :", torch.cuda.is_available(), "(False is normal on a login node)")
 PY
 
-# Pre-download SAM3 once into a cache on /blue that every job reads.
+# Pre-download SAM3 once into a cache that every job reads.
 #
-# Without this, a 60-task array means 60 concurrent ~3 GB downloads from
-# HuggingFace (~180 GB of traffic) and near-certain throttling. With it, jobs
-# run HF_HUB_OFFLINE=1 and never touch the network for weights at all.
+# Without this, an N-task array means N concurrent ~3 GB downloads from
+# HuggingFace and near-certain throttling. With it, jobs run HF_HUB_OFFLINE=1
+# and never touch the network for weights at all.
 echo
 echo "[env] warming the model cache at ${HF_HOME}"
 mkdir -p "${HF_HOME}"
@@ -78,11 +75,14 @@ print("model cache warm")
 PY
 du -sh "${HF_HOME}"
 
+mkdir -p logs
 echo
 echo "── next ─────────────────────────────────────────────────────────────────"
-echo "  1. Get the parquet index to ${PARQUET}"
-echo "       from your workstation:"
-echo "         scp inat_photos.parquet ${USER}@hpg.rc.ufl.edu:${PARQUET}"
-echo "       or build it here:  sbatch slurm/build_index.sbatch"
-echo "  2. Smoke test:          sbatch slurm/test.sbatch"
-echo "  3. Full run:            sbatch --array=0-59 slurm/array.sbatch"
+if [[ -f "${PARQUET}" ]]; then
+    echo "  parquet found: ${PARQUET}"
+else
+    echo "  !! no parquet at ${PARQUET} — set PARQUET in slurm/settings.sh"
+fi
+echo "  1. Smoke test, 1 GPU:     sbatch slurm/test.sbatch"
+echo "  2. Parallel test, 2 GPUs: sbatch slurm/test_2gpu.sbatch"
+echo "  3. Full run:              sbatch --array=0-59 slurm/array.sbatch"

@@ -28,7 +28,7 @@ source slurm/settings.sh
 
 module purge
 module load conda
-conda activate "$CONDA_ENV"
+set +u; conda activate "$CONDA_ENV"; set -u    # conda's activate scripts trip over set -u
 
 date
 # --memory-limit stays under the 24 GB request so DuckDB spills to disk rather

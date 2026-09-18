@@ -12,8 +12,8 @@ see README "What a shard is". Each shard writes its own CSV, so shards never
 collide and each one resumes independently.
 
     python segment.py --taxon-id 160559 --prompt flower \\
-        --parquet /blue/GROUP/USER/data/inat_photos.parquet \\
-        --out /blue/GROUP/USER/results/160559_flower \\
+        --parquet data/inat_photos.parquet \\
+        --out results/160559_flower \\
         --shard 0 --num-shards 60
 
 Output layout (shared by all shards of a run):

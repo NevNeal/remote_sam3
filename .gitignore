@@ -2,6 +2,7 @@
 logs/*
 !logs/.gitkeep
 results/
+hf_cache/
 *_segmentations/
 *_test/
 local_run_*/

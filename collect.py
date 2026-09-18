@@ -8,7 +8,7 @@ a concatenate plus a set of sanity checks, not a conflict resolution. It answers
 the two questions you always have after a big run: did every shard finish, and
 what needs doing again.
 
-    python collect.py /blue/GROUP/USER/results/160559_flower --num-shards 60
+    python collect.py results/160559_flower --num-shards 60
 
 --num-shards is optional but worth passing: without it there is no way to tell a
 shard that finished from one that never started.

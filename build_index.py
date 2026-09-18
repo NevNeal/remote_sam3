@@ -22,7 +22,7 @@ over 289M rows is an expensive extra pass, and the index is meant to mirror the
 source. segment.py drops them per-taxon at read time instead, which is where it
 matters, because the two copies would otherwise be assigned to different shards.
 
-    python build_index.py --data-dir /blue/GROUP/USER/data
+    python build_index.py --data-dir data
 
 Steps are independently skippable and each one skips itself if its output is
 already on disk, so an interrupted run can simply be rerun:
