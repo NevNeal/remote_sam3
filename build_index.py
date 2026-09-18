@@ -2,7 +2,7 @@
 """
 Build the parquet photo index that segment.py reads.
 
-The index is pure metadata — no images. iNaturalist publishes its whole database
+The index is pure metadata - no images. iNaturalist publishes its whole database
 as three tab-separated dumps on a public S3 bucket; this joins them, keeps only
 research-grade observations, and writes seven columns:
 
@@ -29,6 +29,7 @@ job rather than running it on a login node: sbatch slurm/build_index.sbatch
 """
 
 import argparse
+import shutil
 import subprocess
 import sys
 import time
@@ -38,7 +39,7 @@ import duckdb
 
 S3_BUCKET = "s3://inaturalist-open-data"
 
-# (filename, approximate download size) — order matters only for the progress
+# (filename, approximate download size) - order matters only for the progress
 # story: smallest first, so a credentials or network problem surfaces in seconds.
 SOURCES = [
     ("taxa.csv.gz", "~40 MB"),
@@ -66,7 +67,14 @@ TAXA_COLUMNS = {
 
 
 def download(data_dir):
-    """Pull the three dumps from S3. Anonymous — the bucket is public."""
+    """Pull the three dumps from S3. Anonymous - the bucket is public."""
+    # Resolve the executable explicitly: on Windows the installed entry point is
+    # aws.CMD, which CreateProcess will not find from the bare name "aws".
+    aws = shutil.which("aws")
+    if not aws:
+        sys.exit("ERROR: the `aws` CLI is not on PATH. It is in requirements.txt; "
+                 "activate the environment first.")
+
     data_dir.mkdir(parents=True, exist_ok=True)
     for name, size in SOURCES:
         target = data_dir / name
@@ -76,7 +84,7 @@ def download(data_dir):
         print(f"  [get ] {name} (expect {size})")
         started = time.time()
         result = subprocess.run(
-            ["aws", "s3", "cp", "--no-sign-request", f"{S3_BUCKET}/{name}", str(target)]
+            [aws, "s3", "cp", "--no-sign-request", f"{S3_BUCKET}/{name}", str(target)]
         )
         if result.returncode != 0:
             sys.exit(f"ERROR: aws s3 cp failed for {name}")
@@ -89,7 +97,7 @@ def build(data_dir, parquet, memory_limit, threads):
     """Join photos -> observations -> taxa and write the parquet."""
     missing = [name for name, _ in SOURCES if not (data_dir / name).exists()]
     if missing:
-        sys.exit(f"ERROR: missing {', '.join(missing)} — run without --build-only first.")
+        sys.exit(f"ERROR: missing {', '.join(missing)} - run without --build-only first.")
 
     if parquet.exists():
         print(f"  [have] {parquet.name} ({parquet.stat().st_size / 1e9:.2f} GB)")
@@ -152,7 +160,7 @@ def build(data_dir, parquet, memory_limit, threads):
 
 def verify(parquet, taxon_id):
     """Prove the index answers the only question segment.py asks of it."""
-    print(f"\n── verify: taxon {taxon_id} ──────────────────────────────────────────")
+    print(f"\n-- verify: taxon {taxon_id} ------------------------------------------")
     con = duckdb.connect()
     started = time.time()
     rows = con.execute(f"""
@@ -191,11 +199,11 @@ def main():
     parquet = data_dir / "inat_photos.parquet"
 
     if not args.build_only:
-        print("── download ─────────────────────────────────────────────────────────")
+        print("-- download ---------------------------------------------------------")
         download(data_dir)
 
     if not args.download_only:
-        print("── build ────────────────────────────────────────────────────────────")
+        print("-- build ------------------------------------------------------------")
         build(data_dir, parquet, args.memory_limit, args.threads)
         if args.verify_taxon:
             verify(parquet, args.verify_taxon)

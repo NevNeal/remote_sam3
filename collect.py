@@ -52,7 +52,7 @@ def main():
 
 def read_shards(shard_files):
     frames = []
-    print("── shards ───────────────────────────────────────────────────────────")
+    print("-- shards -----------------------------------------------------------")
     for path in shard_files:
         try:
             frame = pd.read_csv(path)
@@ -84,7 +84,7 @@ def clean(merged):
 
 def report(merged, out_path):
     counts = merged["status"].value_counts()
-    print(f"\n── results -> {out_path.name} ───────────────────────────────────────")
+    print(f"\n-- results -> {out_path.name} ---------------------------------------")
     print(f"  photos processed  {len(merged):>9,}")
     for status in ("ok", "download_failed", "segment_failed"):
         print(f"  {status:<17} {int(counts.get(status, 0)):>9,}")
@@ -102,14 +102,14 @@ def report(merged, out_path):
     if not seconds.empty:
         print(f"  median s/photo    {seconds.median():>9.2f}")
         # A median well above what the GPU needs means the run was waiting on
-        # downloads, not on SAM3 — raise --workers before adding GPUs.
+        # downloads, not on SAM3 - raise --workers before adding GPUs.
         if seconds.median() > 2.5:
             print("    ^ looks download-bound; try a higher WORKERS")
 
 
 def check_shards(merged, num_shards):
     present = sorted(merged["shard"].dropna().astype(int).unique())
-    print(f"\n── shards present: {len(present)} ───────────────────────────────────────")
+    print(f"\n-- shards present: {len(present)} ---------------------------------------")
     if not num_shards:
         print("  pass --num-shards to check for shards that never reported")
         return
@@ -121,7 +121,7 @@ def check_shards(merged, num_shards):
 
     spec = ",".join(str(shard) for shard in missing)
     print(f"  MISSING: {spec}")
-    print("  rerun exactly those — NUM_SHARDS must match the original run:")
+    print("  rerun exactly those - NUM_SHARDS must match the original run:")
     print(f"    NUM_SHARDS={num_shards} sbatch --array={spec} slurm/array.sbatch")
 
 
@@ -130,11 +130,11 @@ def show_failures(merged, retry_path):
     if failed.empty:
         return
 
-    print(f"\n── {len(failed):,} failures ──────────────────────────────────────────────")
+    print(f"\n-- {len(failed):,} failures ----------------------------------------------")
     top = failed["error"].astype(str).str.slice(0, 66).value_counts().head(5)
     for message, count in top.items():
         print(f"  {count:>7,}  {message}")
-    print("\n  Dead photo URLs are normal — iNat users delete photos, and the")
+    print("\n  Dead photo URLs are normal - iNat users delete photos, and the")
     print("  open-data dump lags. A steady few percent is expected; a sudden jump")
     print("  usually means you were rate-limited and should lower WORKERS.")
 

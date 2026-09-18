@@ -48,7 +48,7 @@ from urllib3.util.retry import Retry
 
 PHOTO_URL = "https://inaturalist-open-data.s3.amazonaws.com/photos/{photo_id}/original.{ext}"
 
-# Images per batch_NNNNN subfolder. Keeps directory listings survivable — a big
+# Images per batch_NNNNN subfolder. Keeps directory listings survivable - a big
 # taxon is hundreds of thousands of files, and Lustre does not enjoy one flat dir.
 BATCH_SIZE = 1000
 
@@ -72,7 +72,7 @@ CSV_COLUMNS = [
 ]
 
 
-# ── Stage 1: which photos are mine? ──────────────────────────────────────────
+# -- Stage 1: which photos are mine? ------------------------------------------
 
 def load_photos(parquet, taxon_id, limit, shard, num_shards):
     """Read this shard's photo rows for one taxon out of the parquet index.
@@ -126,7 +126,7 @@ def _clean(value):
     return re.sub(r"[^A-Za-z0-9_]+", "", re.sub(r"\s+", "_", str(value or "").strip()))
 
 
-# ── Stage 2: downloading ─────────────────────────────────────────────────────
+# -- Stage 2: downloading -----------------------------------------------------
 
 def make_session(workers):
     session = requests.Session()
@@ -146,7 +146,7 @@ def fetch(session, row, image_path):
         try:
             return row, Image.open(image_path).convert("RGB"), None
         except Exception:
-            pass  # truncated from a killed job — fall through and re-download
+            pass  # truncated from a killed job - fall through and re-download
 
     try:
         response = session.get(row["photo_url"], timeout=HTTP_TIMEOUT)
@@ -161,7 +161,7 @@ def fetch(session, row, image_path):
         return row, None, str(exc)
 
 
-# ── Stage 3: mask bookkeeping ────────────────────────────────────────────────
+# -- Stage 3: mask bookkeeping ------------------------------------------------
 
 def to_binary(mask, size):
     """SAM3 mask (tensor or array, maybe not image-sized) -> uint8 0/1 at `size`."""
@@ -182,7 +182,7 @@ def bbox(mask):
 
 
 def avg_rgb(image, mask):
-    """Mean colour inside one mask — the whole point for flower-colour work."""
+    """Mean colour inside one mask - the whole point for flower-colour work."""
     pixels = np.asarray(image)[mask > 0]
     if not len(pixels):
         return ""
@@ -246,7 +246,7 @@ def _label(draw, x, y, text, font):
     draw.text((x, y), text, fill=(255, 255, 255, 255), font=font)
 
 
-# ── Stage 4: the run ─────────────────────────────────────────────────────────
+# -- Stage 4: the run ---------------------------------------------------------
 
 class Results:
     """Append-only per-shard CSV. One row per photo, written as we go, so a job
@@ -304,7 +304,7 @@ def main():
         props = torch.cuda.get_device_properties(0)
         print(f"gpu        : {props.name} ({props.total_memory / 1e9:.0f} GB)")
     else:
-        print("gpu        : NONE — running on CPU, this will be very slow")
+        print("gpu        : NONE - running on CPU, this will be very slow")
 
     model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
     processor = Sam3Processor.from_pretrained("facebook/sam3")
