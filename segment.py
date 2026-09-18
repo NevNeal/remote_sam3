@@ -29,6 +29,7 @@ Output layout (shared by all shards of a run):
 import argparse
 import csv
 import os
+import platform
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -282,7 +283,7 @@ def main():
     results = Results(out / f"results_shard_{args.shard:03d}.csv",
                       out / f"errors_shard_{args.shard:03d}.txt")
 
-    print(f"host       : {os.uname().nodename}")
+    print(f"host       : {platform.node()}")
     print(f"slurm job  : {os.environ.get('SLURM_JOB_ID', '-')}"
           f" task {os.environ.get('SLURM_ARRAY_TASK_ID', '-')}")
 
