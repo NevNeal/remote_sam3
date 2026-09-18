@@ -66,19 +66,40 @@ def read_shards(shard_files):
     return pd.concat(frames, ignore_index=True)
 
 
+# A complete row always has all three. A row missing any of them was still being
+# written when the process died, whatever else happened to parse out of it.
+REQUIRED = ["photo_id", "row_index", "status"]
+
+
 def clean(merged):
     """Drop the damage a job killed at its walltime can leave behind.
 
-    A task terminated mid-write leaves a truncated final line, which pandas reads
-    as a row full of NaN. A requeued task can also re-record a photo it had
-    already finished, so keep the last mention of each photo_id.
+    A task terminated mid-write leaves a truncated final line. Filtering on
+    photo_id alone does not catch it: photo_id is the FIRST column, so it is
+    precisely the field a truncated line still has. Such a row parses with a
+    valid id and NaN for everything past the cut. Requiring the later columns
+    too is what actually catches it.
+
+    Order matters. That truncated row is a second mention of a photo_id the shard
+    had already recorded properly, so incomplete rows must go BEFORE
+    de-duplication -- dedup first, with keep="last", would keep the fragment and
+    throw away the good row.
+
+    After that, keep="last" is correct: a requeued task re-recording a photo means
+    the later row is the newer attempt.
     """
     before = len(merged)
-    merged = merged.dropna(subset=["photo_id"]).copy()
-    merged["photo_id"] = merged["photo_id"].astype("int64")
+    incomplete = int(merged[REQUIRED].isna().any(axis=1).sum())
+    merged = merged.dropna(subset=REQUIRED).copy()
+    for column in ("photo_id", "row_index"):
+        merged[column] = merged[column].astype("int64")
+
     merged = merged.drop_duplicates(subset=["photo_id"], keep="last")
-    if len(merged) != before:
-        print(f"\n  dropped {before - len(merged):,} truncated or duplicated rows")
+    duplicates = before - incomplete - len(merged)
+
+    if incomplete or duplicates:
+        print(f"\n  dropped {incomplete:,} incomplete (truncated mid-write) "
+              f"and {duplicates:,} duplicate rows")
     return merged.sort_values("row_index").reset_index(drop=True)
 
 
