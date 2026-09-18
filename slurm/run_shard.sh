@@ -74,6 +74,20 @@ args=(
 if [[ -n "${LIMIT:-}" ]]; then
     args+=(--limit "$LIMIT")
 fi
+# DISCARD=1: benchmark mode — every output is written, measured, then deleted.
+if [[ -n "${DISCARD:-}" ]]; then
+    args+=(--discard-outputs)
+fi
+
+# GPU telemetry: one sample every TELEMETRY_S seconds for the life of the shard.
+# If several shards share a node and nvidia-smi can see all its GPUs, the report
+# picks this shard's rows out by the GPU UUID segment.py records.
+mkdir -p "$OUT_DIR/telemetry"
+nvidia-smi --query-gpu=timestamp,uuid,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw,temperature.gpu,clocks.sm \
+    --format=csv,nounits -l "${TELEMETRY_S:-10}" \
+    > "$OUT_DIR/telemetry/gpu_shard_$(printf %03d "$SHARD").csv" 2>/dev/null &
+sampler=$!
+trap 'kill "$sampler" 2>/dev/null || true' EXIT
 
 python segment.py "${args[@]}"
 

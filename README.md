@@ -16,6 +16,8 @@ environment.yml    the HiPerGator conda env: python 3.12 + torch cu128 + pins
 requirements.txt   pip packages, pinned (pulled in by environment.yml)
 slurm/settings.sh  ← THE ONLY FILE YOU EDIT
 slurm/run_shard.sh one shard on one GPU — what every GPU job runs
+slurm/bench.sh     benchmark a taxon: timed run + report, outputs deleted
+bench_report.py    turns a benchmark's raw timing into report.md
 slurm/*.sbatch     the jobs: test (1 GPU), test_2gpu (2 GPUs), array (N GPUs),
                    build_index (CPU)
 ```
@@ -436,6 +438,38 @@ rsync -ah --info=progress2 results/160559_flower/ \
 ```
 
 ---
+
+## 6b. Benchmarking a taxon (timing only, nothing kept)
+
+```bash
+TAXON_ID=62741 bash slurm/bench.sh          # 10 GPUs; pass 0-19 for 20
+```
+
+This runs the whole taxon across the GPUs exactly like a real run, but with
+`--discard-outputs`. Every image, mask, overlay and cut-out is written, so save
+time and file sizes are real. Each is then measured and deleted immediately, so
+the run needs almost no space on `/blue`. When every GPU task has ended,
+a second job (`bench_report.sbatch`) saves the evidence to
+`benchmarks/<taxon>_<prompt>_<timestamp>/`, writes `report.md`, and deletes the
+run's `results/` directory.
+
+What gets measured:
+
+| | where |
+|---|---|
+| per photo: download seconds, bytes, MB/s | `download_s`, `download_bytes`, `download_mbps` |
+| per photo: GPU idle waiting for that download | `wait_s` |
+| per photo: CPU preprocessing, GPU forward pass (cuda-synced), post-processing, saving | `prep_s`, `infer_s`, `post_s`, `save_s` |
+| per photo: bytes it would have used on disk | `output_bytes` |
+| per shard: parquet load, model load, loop time, node, GPU UUID | `raw/timing_shard_NNN.json` |
+| per GPU: utilisation, memory, power, clocks every 5 s | `raw/telemetry/gpu_shard_NNN.csv` |
+| per task: node, elapsed, CPU time, peak RAM | `sacct.txt` |
+
+`report.md` rolls these up into wall-clock time and throughput. Per node it
+gives allocated vs busy GPU-hours and download-wait hours. Downloads get
+median/p95 speeds and times plus the most common errors, and there is an
+estimate of the storage a kept run would need. `per_shard.csv`,
+`per_node.csv` and `summary.json` hold the same numbers for plotting.
 
 ## 7. Open items
 

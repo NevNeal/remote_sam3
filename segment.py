@@ -28,6 +28,7 @@ Output layout (shared by all shards of a run):
 
 import argparse
 import csv
+import json
 import os
 import platform
 import re
@@ -69,6 +70,14 @@ CSV_COLUMNS = [
     "photo_url", "row_index", "shard", "batch", "status", "num_masks",
     "image_path", "overlay_path", "mask_paths", "segment_paths",
     "mask_scores", "mask_avg_rgb", "seconds", "error",
+    # Timing, per photo. The download runs in a worker thread and overlaps the
+    # GPU work; wait_s is how long the main loop actually sat waiting for it,
+    # i.e. GPU idle time caused by downloads. prep/infer/post/save split the
+    # main-loop work; infer_s is bracketed by cuda.synchronize so it is true
+    # GPU time, not kernel-launch time. seconds = prep + infer + post + save.
+    "host", "gpu", "done_at", "width", "height",
+    "download_s", "download_bytes", "download_mbps", "reused_image",
+    "wait_s", "prep_s", "infer_s", "post_s", "save_s", "output_bytes",
 ]
 
 
@@ -149,27 +158,35 @@ def make_session(workers):
 
 
 def fetch(session, row, image_path):
-    """Return (row, PIL image or None, error string or None).
+    """Return (row, PIL image or None, error string or None, timing dict).
 
     An already-downloaded image is reused, which is what makes a rerun cheap.
+    download_s covers the whole HTTP transfer including any retries.
     """
     if image_path.exists() and image_path.stat().st_size > 0:
         try:
-            return row, Image.open(image_path).convert("RGB"), None
+            info = {"reused_image": 1, "download_bytes": image_path.stat().st_size}
+            return row, Image.open(image_path).convert("RGB"), None, info
         except Exception:
             pass  # truncated from a killed job - fall through and re-download
 
+    started = time.perf_counter()
+    info = {"reused_image": 0}
     try:
         response = session.get(row["photo_url"], timeout=HTTP_TIMEOUT)
         response.raise_for_status()
         data = response.content
+        elapsed = time.perf_counter() - started
+        info.update(download_s=round(elapsed, 4), download_bytes=len(data),
+                    download_mbps=round(len(data) / 1e6 / elapsed, 3) if elapsed else "")
         image_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = image_path.with_suffix(image_path.suffix + ".part")
         tmp.write_bytes(data)
         tmp.replace(image_path)
-        return row, Image.open(BytesIO(data)).convert("RGB"), None
+        return row, Image.open(BytesIO(data)).convert("RGB"), None, info
     except Exception as exc:
-        return row, None, str(exc)
+        info["download_s"] = round(time.perf_counter() - started, 4)
+        return row, None, str(exc), info
 
 
 # -- Stage 3: mask bookkeeping ------------------------------------------------
@@ -294,12 +311,16 @@ def main():
     results = Results(out / f"results_shard_{args.shard:03d}.csv",
                       out / f"errors_shard_{args.shard:03d}.txt")
 
-    print(f"host       : {platform.node()}")
+    shard_started = time.time()
+    args.host = platform.node()
+    print(f"host       : {args.host}")
     print(f"slurm job  : {os.environ.get('SLURM_JOB_ID', '-')}"
           f" task {os.environ.get('SLURM_ARRAY_TASK_ID', '-')}")
 
+    t0 = time.perf_counter()
     photos = load_photos(args.parquet, args.taxon_id, args.limit,
                          args.shard, args.num_shards)
+    parquet_s = time.perf_counter() - t0
 
     done = results.already_done()
     todo = photos[~photos["photo_id"].isin(done)]
@@ -313,12 +334,18 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cuda":
         props = torch.cuda.get_device_properties(0)
+        args.gpu = props.name
+        args.gpu_uuid = f"GPU-{props.uuid}"
         print(f"gpu        : {props.name} ({props.total_memory / 1e9:.0f} GB)")
     else:
+        args.gpu, args.gpu_uuid = "cpu", ""
         print("gpu        : NONE - running on CPU, this will be very slow")
 
+    t0 = time.perf_counter()
     model = Sam3Model.from_pretrained("facebook/sam3").to(device).eval()
     processor = Sam3Processor.from_pretrained("facebook/sam3")
+    model_load_s = time.perf_counter() - t0
+    print(f"model load : {model_load_s:.1f}s")
     session = make_session(args.workers)
 
     tally = {"ok": 0, "no_detections": 0, "download_failed": 0, "segment_failed": 0}
@@ -327,22 +354,46 @@ def main():
 
     # Download a chunk in parallel, then segment that chunk one image at a time.
     # The GPU idles briefly at each chunk boundary; in exchange the control flow
-    # is obvious and memory is bounded. With workers=16 and CHUNK=64 the stall is
-    # a fraction of a second against ~60s of GPU work per chunk.
+    # is obvious and memory is bounded. wait_s records exactly how long.
+    loop_started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for start in range(0, len(rows), CHUNK):
             chunk = rows[start:start + CHUNK]
             fetched = pool.map(
                 lambda row: fetch(session, row, _image_path(out, row)), chunk
             )
-            for row, image, error in fetched:
-                _handle(row, image, error, out, model, processor,
+            while True:
+                waited = time.perf_counter()
+                try:
+                    row, image, error, info = next(fetched)
+                except StopIteration:
+                    break
+                info["wait_s"] = round(time.perf_counter() - waited, 4)
+                _handle(row, image, error, info, out, model, processor,
                         device, args, results, tally, progress)
+    loop_s = time.perf_counter() - loop_started
 
     progress.close()
     print(f"\nshard {args.shard} done: " +
           "  ".join(f"{k}={v:,}" for k, v in tally.items()))
+    print(f"loop       : {loop_s:.1f}s for {len(rows):,} photos"
+          f" ({len(rows) / loop_s:.2f} photos/s)" if loop_s else "")
     print(f"results: {results.path}")
+
+    # Shard-level phases, for the benchmark report. Per-photo detail is in the CSV.
+    timing = {
+        "shard": args.shard, "num_shards": args.num_shards, "host": args.host,
+        "gpu": args.gpu, "gpu_uuid": args.gpu_uuid, "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+        "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "workers": args.workers, "chunk": CHUNK, "discard_outputs": args.discard_outputs,
+        "started_at": shard_started, "finished_at": time.time(),
+        "parquet_s": round(parquet_s, 2), "model_load_s": round(model_load_s, 2),
+        "loop_s": round(loop_s, 2), "photos": len(rows), "resumed_from": len(done),
+        "tally": tally,
+    }
+    (out / f"timing_shard_{args.shard:03d}.json").write_text(json.dumps(timing, indent=2))
 
 
 def _image_path(out, row):
@@ -351,48 +402,60 @@ def _image_path(out, row):
     return out / "images" / row["batch"] / f"{row['stem']}.{ext}"
 
 
-def _handle(row, image, error, out, model, processor, device,
+def _handle(row, image, error, info, out, model, processor, device,
             args, results, tally, progress):
     """Segment one image and record exactly one CSV row for it."""
+    image_path = _image_path(out, row)
     common = {
         "photo_id": row["photo_id"], "taxon_id": row["taxon_id"],
         "taxon_name": row["taxon_name"], "quality_grade": row["quality_grade"],
         "latitude": row["latitude"], "longitude": row["longitude"],
         "photo_url": row["photo_url"], "row_index": row["row_index"],
         "shard": args.shard, "batch": row["batch"],
-        "image_path": str(_image_path(out, row).relative_to(out)),
+        "image_path": str(image_path.relative_to(out)),
+        "host": args.host, "gpu": args.gpu,
+        **info,
     }
 
     if image is None:
         tally["download_failed"] += 1
-        results.write(status="download_failed", num_masks=0, error=error, **common)
+        results.write(status="download_failed", num_masks=0, error=error,
+                      done_at=f"{time.time():.3f}", **common)
         results.note_error(f"[download] photo_id={row['photo_id']} {error}")
         progress.update(1)
         return
 
-    started = time.time()
+    common.update(width=image.size[0], height=image.size[1])
+    started = time.perf_counter()
     try:
-        masks, scores = segment(model, processor, image, args.prompt,
-                                args.min_score, device, args.bf16)
+        masks, scores, stages = segment(model, processor, image, args.prompt,
+                                        args.min_score, device, args.bf16)
     except Exception as exc:
         tally["segment_failed"] += 1
         results.write(status="segment_failed", num_masks=0, error=str(exc),
-                      seconds=f"{time.time() - started:.2f}", **common)
+                      seconds=f"{time.perf_counter() - started:.3f}",
+                      done_at=f"{time.time():.3f}", **common)
         results.note_error(f"[segment] photo_id={row['photo_id']} {exc}")
+        if args.discard_outputs:
+            _discard([image_path])
         progress.update(1)
         return
 
+    saving = time.perf_counter()
     stem = row["stem"]
+    written = []
     mask_paths, segment_paths, rgbs = [], [], []
     for i, mask in enumerate(masks):
         mask_path = out / "masks" / row["batch"] / f"{stem}_instance_{i}.npy"
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(mask_path, mask)
         mask_paths.append(str(mask_path.relative_to(out)))
+        written.append(mask_path)
 
         cutout = out / "segments" / row["batch"] / f"{stem}_segment_{i}.png"
         if save_cutout(image, mask, cutout):
             segment_paths.append(str(cutout.relative_to(out)))
+            written.append(cutout)
 
         rgbs.append(avg_rgb(image, mask))
 
@@ -401,9 +464,17 @@ def _handle(row, image, error, out, model, processor, device,
         overlay = out / "overlays" / row["batch"] / f"{stem}_overlay.png"
         save_overlay(image, masks, scores, args.prompt, overlay)
         overlay_rel = str(overlay.relative_to(out))
+        written.append(overlay)
         tally["ok"] += 1
     else:
         tally["no_detections"] += 1
+    save_s = time.perf_counter() - saving
+
+    # What this photo would cost on disk if kept: the downloaded image plus
+    # everything written for it. Measured before any discard.
+    output_bytes = sum(p.stat().st_size for p in written + [image_path] if p.exists())
+    if args.discard_outputs:
+        _discard(written + [image_path])
 
     results.write(
         status="ok", num_masks=len(masks),
@@ -412,22 +483,45 @@ def _handle(row, image, error, out, model, processor, device,
         segment_paths=";".join(segment_paths),
         mask_scores=",".join(f"{s:.4f}" for s in scores),
         mask_avg_rgb=";".join(rgbs),
-        seconds=f"{time.time() - started:.2f}",
-        **common,
+        seconds=f"{time.perf_counter() - started:.3f}",
+        save_s=f"{save_s:.4f}", output_bytes=output_bytes,
+        done_at=f"{time.time():.3f}",
+        **stages, **common,
     )
     progress.update(1)
 
 
+def _discard(paths):
+    """Benchmark mode: delete a photo's files as soon as they are measured."""
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def segment(model, processor, image, prompt, min_score, device, bf16):
-    """One SAM3 forward pass. Returns (masks, scores) sorted most-confident first."""
+    """One SAM3 forward pass.
+
+    Returns (masks, scores, stages): masks/scores sorted most-confident first,
+    stages = {prep_s, infer_s, post_s} for the timing columns.
+    """
+    cuda = device == "cuda"
+    t0 = time.perf_counter()
     inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+    if cuda:
+        torch.cuda.synchronize()
+    t1 = time.perf_counter()
 
     with torch.inference_mode():
-        if bf16 and device == "cuda":
+        if bf16 and cuda:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(**inputs)
         else:
             outputs = model(**inputs)
+    if cuda:
+        torch.cuda.synchronize()     # kernels are async; wait so this is real GPU time
+    t2 = time.perf_counter()
 
     detections = processor.post_process_instance_segmentation(
         outputs,
@@ -436,23 +530,24 @@ def segment(model, processor, image, prompt, min_score, device, bf16):
         target_sizes=inputs.get("original_sizes").tolist(),
     )[0]
 
+    masks, kept = [], []
     raw_masks = detections.get("masks")
     raw_scores = detections.get("scores")
-    if raw_masks is None or raw_scores is None or len(raw_scores) == 0:
-        return [], []
+    if raw_masks is not None and raw_scores is not None and len(raw_scores):
+        scores = [float(s) for s in raw_scores]
+        pairs = sorted(zip(raw_masks, scores), key=lambda pair: pair[1], reverse=True)
+        for mask, score in pairs:
+            if score < min_score:
+                continue
+            binary = to_binary(mask, image.size)
+            if binary.any():
+                masks.append(binary)
+                kept.append(score)
+    t3 = time.perf_counter()
 
-    scores = [float(s) for s in raw_scores]
-    pairs = sorted(zip(raw_masks, scores), key=lambda pair: pair[1], reverse=True)
-
-    masks, kept = [], []
-    for mask, score in pairs:
-        if score < min_score:
-            continue
-        binary = to_binary(mask, image.size)
-        if binary.any():
-            masks.append(binary)
-            kept.append(score)
-    return masks, kept
+    stages = {"prep_s": f"{t1 - t0:.4f}", "infer_s": f"{t2 - t1:.4f}",
+              "post_s": f"{t3 - t2:.4f}"}
+    return masks, kept, stages
 
 
 def parse_args():
@@ -471,6 +566,10 @@ def parse_args():
                         help="Use only the first N photos of the taxon (for testing)")
     parser.add_argument("--bf16", action="store_true",
                         help="Run inference in bfloat16 (faster; slightly different masks)")
+    parser.add_argument("--discard-outputs", action="store_true",
+                        help="Benchmark mode: write each photo's image, masks, overlay and "
+                             "cut-outs (so timing is real), measure them, then delete them. "
+                             "The results CSV and timing JSON are kept.")
     args = parser.parse_args()
     args.num_shards = max(1, args.num_shards)
     return args
