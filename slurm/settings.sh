@@ -32,6 +32,18 @@ RESULTS="${RESULTS:-${PROJECT}/results}"
 # Shared, pre-warmed model cache — see setup_env.sh.
 export HF_HOME="${HF_HOME:-${PROJECT}/hf_cache}"
 
+# ── Images already on /blue, instead of a taxon from S3 ──────────────────────
+# Set LOCAL_INDEX and every job segments the files listed in that parquet, in
+# place, with no downloads — TAXON_ID and PARQUET are then unused. IMAGE_ROOT is
+# the directory the index's leading 'data/' maps to:
+#
+#   index:  data/phenobase_inat_data/images/medium/batch_1/9208.webp
+#   disk:   $IMAGE_ROOT/phenobase_inat_data/images/medium/batch_1/9208.webp
+#
+# slurm/local.sbatch sets LOCAL_INDEX for you; leave it empty for taxon runs.
+LOCAL_INDEX="${LOCAL_INDEX:-}"
+IMAGE_ROOT="${IMAGE_ROOT:-/home/neal.nevyn/blue_guralnick/share}"
+
 # ── What to segment ──────────────────────────────────────────────────────────
 TAXON_ID="${TAXON_ID:-160559}"
 PROMPT="${PROMPT:-flower}"

@@ -16,6 +16,14 @@ collide and each one resumes independently.
         --out results/160559_flower \\
         --shard 0 --num-shards 60
 
+Images that are already on /blue are segmented in place instead, with no taxon
+and no S3 (see load_local_photos):
+
+    python segment.py --local-index data/local_image_paths.parquet \\
+        --image-root /home/neal.nevyn/blue_guralnick/share \\
+        --out results/local_flower --prompt flower \\
+        --shard 0 --num-shards 5
+
 Output layout (shared by all shards of a run):
 
     <out>/images/batch_00001/Genus_species_<photo_id>.jpg
@@ -56,6 +64,10 @@ BATCH_SIZE = 1000
 # How many downloaded images to hold in memory before segmenting them. Bigger
 # means the GPU waits less at chunk boundaries and more RAM is used.
 CHUNK = 64
+
+# The local index records every path as .webp, but what is actually on disk may
+# have kept its original extension. Try the recorded name, then these.
+LOCAL_EXTS = ("webp", "jpg", "jpeg", "png", "JPG", "JPEG", "PNG", "gif")
 
 MASK_THRESHOLD = 0.80        # binarisation cutoff inside SAM3's post-processing
 HTTP_TIMEOUT = 60
@@ -134,6 +146,59 @@ def load_photos(parquet, taxon_id, limit, shard, num_shards):
     return df
 
 
+def load_local_photos(index, image_root, limit, shard, num_shards):
+    """Read this shard's rows out of an index of images already on disk.
+
+    Same contract as load_photos and the same interleaved sharding, minus the
+    network: the index's `file_name` is a path whose leading `data/` is replaced
+    by `image_root`, and the image is read where it already sits on /blue. There
+    is no taxon filter — the index IS the selection (local_image_paths.parquet
+    is the flowering rows of the annotation CSV).
+    """
+    t0 = time.time()
+    df = pd.read_parquet(index, columns=["photo_id", "taxon_id", "scientific_name",
+                                         "reproductive_condition", "file_name"])
+    df = df.sort_values("photo_id").reset_index(drop=True)
+    print(f"index      : {len(df):,} local photos from {index} in {time.time() - t0:.1f}s")
+
+    if df.empty:
+        raise SystemExit(f"No rows in {index}.")
+
+    duplicates = int(df["photo_id"].duplicated().sum())
+    if duplicates:
+        df = df.drop_duplicates(subset=["photo_id"]).reset_index(drop=True)
+        print(f"           : dropped {duplicates:,} duplicate photo_id rows")
+
+    if limit:
+        df = df.head(limit).copy()
+
+    df["row_index"] = np.arange(len(df))
+    df["taxon_name"] = df["scientific_name"]
+    # Columns the CSV and the report expect but a local run has no source for.
+    df["quality_grade"] = ""
+    df["latitude"] = ""
+    df["longitude"] = ""
+
+    root = Path(image_root).expanduser()
+    paths = [str(root / re.sub(r"^data/", "", str(f))) for f in df["file_name"]]
+    df["local_path"] = paths
+    df["photo_url"] = paths          # recorded in the CSV as the image's origin
+    df["extension"] = [Path(f).suffix.lstrip(".").lower() for f in df["file_name"]]
+    df["stem"] = [
+        f"{_genus_species(n)}_{int(p)}" for n, p in zip(df["taxon_name"], df["photo_id"])
+    ]
+    df["batch"] = [f"batch_{i // BATCH_SIZE + 1:05d}" for i in df["row_index"]]
+
+    if num_shards > 1:
+        total = len(df)
+        df = df[df["row_index"] % num_shards == shard].copy()
+        print(f"shard      : {shard} of {num_shards} -> {len(df):,} of {total:,} photos")
+        if df.empty:
+            raise SystemExit(f"Shard {shard} got no rows (index smaller than {num_shards}).")
+
+    return df
+
+
 def _genus_species(name):
     """'Symphyotrichum novae-angliae' -> 'Symphyotrichum_novaeangliae'."""
     parts = str(name or "").strip().split()
@@ -187,6 +252,39 @@ def fetch(session, row, image_path):
     except Exception as exc:
         info["download_s"] = round(time.perf_counter() - started, 4)
         return row, None, str(exc), info
+
+
+def resolve_local(path):
+    """The index says .webp; the file on disk may have kept its original
+    extension. Returns the path that exists, or None."""
+    path = Path(path)
+    if path.exists():
+        return path
+    for ext in LOCAL_EXTS:
+        alternative = path.with_suffix(f".{ext}")
+        if alternative.exists():
+            return alternative
+    return None
+
+
+def fetch_local(row):
+    """fetch()'s signature, for images already on /blue. Nothing is downloaded
+    or copied — the file is opened where it lies, and never deleted."""
+    started = time.perf_counter()
+    info = {"reused_image": 1, "download_mbps": ""}
+    path = resolve_local(row["local_path"])
+    if path is None:
+        info["download_s"] = round(time.perf_counter() - started, 4)
+        return row, None, f"missing: {row['local_path']} (no known extension)", info
+    try:
+        image = Image.open(path).convert("RGB")
+    except Exception as exc:
+        info["download_s"] = round(time.perf_counter() - started, 4)
+        return row, None, f"unreadable: {path}: {exc}", info
+    row["local_path"] = str(path)          # the extension that actually existed
+    info["download_bytes"] = path.stat().st_size
+    info["download_s"] = round(time.perf_counter() - started, 4)
+    return row, image, None, info
 
 
 # -- Stage 3: mask bookkeeping ------------------------------------------------
@@ -318,8 +416,12 @@ def main():
           f" task {os.environ.get('SLURM_ARRAY_TASK_ID', '-')}")
 
     t0 = time.perf_counter()
-    photos = load_photos(args.parquet, args.taxon_id, args.limit,
-                         args.shard, args.num_shards)
+    if args.local_index:
+        photos = load_local_photos(args.local_index, args.image_root, args.limit,
+                                   args.shard, args.num_shards)
+    else:
+        photos = load_photos(args.parquet, args.taxon_id, args.limit,
+                             args.shard, args.num_shards)
     parquet_s = time.perf_counter() - t0
 
     done = results.already_done()
@@ -346,7 +448,12 @@ def main():
     processor = Sam3Processor.from_pretrained("facebook/sam3")
     model_load_s = time.perf_counter() - t0
     print(f"model load : {model_load_s:.1f}s")
-    session = make_session(args.workers)
+    if args.local_index:
+        fetch_one = fetch_local
+        print(f"images     : read in place under {args.image_root}, never deleted")
+    else:
+        session = make_session(args.workers)
+        fetch_one = lambda row: fetch(session, row, _image_path(out, row))
 
     tally = {"ok": 0, "no_detections": 0, "download_failed": 0, "segment_failed": 0}
     rows = todo.to_dict("records")
@@ -359,9 +466,7 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         for start in range(0, len(rows), CHUNK):
             chunk = rows[start:start + CHUNK]
-            fetched = pool.map(
-                lambda row: fetch(session, row, _image_path(out, row)), chunk
-            )
+            fetched = pool.map(fetch_one, chunk)
             while True:
                 waited = time.perf_counter()
                 try:
@@ -397,6 +502,10 @@ def main():
 
 
 def _image_path(out, row):
+    """Where this photo's image is. Local runs read it in place on /blue;
+    otherwise it is the download target under <out>."""
+    if row.get("local_path"):
+        return Path(row["local_path"])
     ext = str(row["extension"]).lower().lstrip(".")
     ext = ext if ext in ("jpg", "jpeg", "png") else "jpg"
     return out / "images" / row["batch"] / f"{row['stem']}.{ext}"
@@ -412,7 +521,7 @@ def _handle(row, image, error, info, out, model, processor, device,
         "latitude": row["latitude"], "longitude": row["longitude"],
         "photo_url": row["photo_url"], "row_index": row["row_index"],
         "shard": args.shard, "batch": row["batch"],
-        "image_path": str(image_path.relative_to(out)),
+        "image_path": _relative(image_path, out),
         "host": args.host, "gpu": args.gpu,
         **info,
     }
@@ -436,7 +545,7 @@ def _handle(row, image, error, info, out, model, processor, device,
                       seconds=f"{time.perf_counter() - started:.3f}",
                       done_at=f"{time.time():.3f}", **common)
         results.note_error(f"[segment] photo_id={row['photo_id']} {exc}")
-        if args.discard_outputs:
+        if args.discard_outputs and not row.get("local_path"):
             _discard([image_path])
         progress.update(1)
         return
@@ -474,7 +583,8 @@ def _handle(row, image, error, info, out, model, processor, device,
     # everything written for it. Measured before any discard.
     output_bytes = sum(p.stat().st_size for p in written + [image_path] if p.exists())
     if args.discard_outputs:
-        _discard(written + [image_path])
+        # In local mode the image is the source data on /blue, not ours to delete.
+        _discard(written if row.get("local_path") else written + [image_path])
 
     results.write(
         status="ok", num_masks=len(masks),
@@ -489,6 +599,15 @@ def _handle(row, image, error, info, out, model, processor, device,
         **stages, **common,
     )
     progress.update(1)
+
+
+def _relative(path, out):
+    """Path relative to the run directory, or absolute if it lives elsewhere
+    (a local run's images do)."""
+    try:
+        return str(path.relative_to(out))
+    except ValueError:
+        return str(path)
 
 
 def _discard(paths):
@@ -553,8 +672,13 @@ def segment(model, processor, image, prompt, min_score, device, bf16):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--taxon-id", type=int, required=True, help="iNaturalist taxon ID")
-    parser.add_argument("--parquet", required=True, help="Path to inat_photos.parquet")
+    parser.add_argument("--taxon-id", type=int, help="iNaturalist taxon ID")
+    parser.add_argument("--parquet", help="Path to inat_photos.parquet")
+    parser.add_argument("--local-index",
+                        help="Parquet of images already on disk (local_image_paths.parquet). "
+                             "Segments those files in place; no taxon, no S3.")
+    parser.add_argument("--image-root",
+                        help="Directory the local index's leading 'data/' maps to")
     parser.add_argument("--out", required=True, help="Output directory (on /blue)")
     parser.add_argument("--prompt", default="flower", help="SAM3 text prompt")
     parser.add_argument("--min-score", type=float, default=0.9,
@@ -571,6 +695,12 @@ def parse_args():
                              "cut-outs (so timing is real), measure them, then delete them. "
                              "The results CSV and timing JSON are kept.")
     args = parser.parse_args()
+    if args.local_index:
+        if not args.image_root:
+            parser.error("--image-root is required with --local-index")
+    elif not (args.taxon_id and args.parquet):
+        parser.error("--taxon-id and --parquet are required "
+                     "(or use --local-index with --image-root)")
     args.num_shards = max(1, args.num_shards)
     return args
 

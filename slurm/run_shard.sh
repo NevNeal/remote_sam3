@@ -6,6 +6,7 @@
 #     test.sbatch        1 shard,  100 images
 #     test_2gpu.sbatch   2 shards, 200 images, both GPUs at once
 #     array.sbatch       N shards, the whole taxon
+#     local.sbatch       N shards over images already on /blue (LOCAL_INDEX)
 #
 # Inputs (environment): SHARD, NUM_SHARDS, and optionally LIMIT and OUT_DIR,
 # plus everything in settings.sh.
@@ -25,7 +26,17 @@ source slurm/settings.sh
 
 # ── Preflight: fail in seconds, not after a queue wait and a model load ─────
 fail=0
-if [[ ! -f "$PARQUET" ]]; then
+if [[ -n "${LOCAL_INDEX:-}" ]]; then
+    # Local mode: the index and the images it points at, not the taxon parquet.
+    if [[ ! -f "$LOCAL_INDEX" ]]; then
+        echo "ERROR: no local index at $LOCAL_INDEX" >&2
+        fail=1
+    fi
+    if [[ ! -d "$IMAGE_ROOT" ]]; then
+        echo "ERROR: IMAGE_ROOT does not exist: $IMAGE_ROOT" >&2
+        fail=1
+    fi
+elif [[ ! -f "$PARQUET" ]]; then
     echo "ERROR: no parquet at $PARQUET" >&2
     ls -la "$(dirname "$PARQUET")"/*.parquet 2>/dev/null >&2 \
         && echo "       set PARQUET=<one of the above> in slurm/settings.sh" >&2
@@ -59,9 +70,12 @@ echo "node       : $(hostname)"
 echo "gpu        : $(nvidia-smi --query-gpu=name,uuid,memory.total --format=csv,noheader)"
 echo "started    : $(date -Iseconds)"
 
-args=(
-    --taxon-id   "$TAXON_ID"
-    --parquet    "$PARQUET"
+if [[ -n "${LOCAL_INDEX:-}" ]]; then
+    args=(--local-index "$LOCAL_INDEX" --image-root "$IMAGE_ROOT")
+else
+    args=(--taxon-id "$TAXON_ID" --parquet "$PARQUET")
+fi
+args+=(
     --out        "$OUT_DIR"
     --prompt     "$PROMPT"
     --min-score  "$MIN_SCORE"

@@ -471,6 +471,55 @@ median/p95 speeds and times plus the most common errors, and there is an
 estimate of the storage a kept run would need. `per_shard.csv`,
 `per_node.csv` and `summary.json` hold the same numbers for plotting.
 
+## 6c. Images already on /blue (no taxon, no downloads)
+
+The phenovision iNat images are already on the filesystem, so for those there is
+nothing to download and no taxon to enumerate. `data/local_image_paths.parquet`
+is the list: the **2,849,542 flowering rows** of
+`repro_annotations_full_2026-07-14.csv` (`flowering=1`, so bud-only observations
+are out), with `photo_id`, `taxon_id`, `scientific_name`,
+`reproductive_condition`, `fruiting` and `file_name`.
+
+Get the index onto HiPerGator once — it is tracked on `main`, because `data/` is
+gitignored on this branch:
+
+```bash
+cd ~/blue_guralnick/neal.nevyn/flower_sam3
+git fetch origin main
+git show origin/main:data/local_image_paths.parquet > data/local_image_paths.parquet
+```
+
+Then:
+
+```bash
+sbatch --array=0-4 slurm/local.sbatch          # 5 GPUs, first 5,000 images
+LIMIT= sbatch --array=0-59 slurm/local.sbatch  # no limit: all 2.8M
+python collect.py results/local_flower --num-shards 5
+```
+
+`IMAGE_ROOT` in `slurm/settings.sh` is what the index's leading `data/` maps to,
+and it defaults to the share:
+
+```
+index:  data/phenobase_inat_data/images/medium/batch_1/9208.webp
+disk:   /home/neal.nevyn/blue_guralnick/share/phenobase_inat_data/images/medium/batch_1/9208.webp
+```
+
+Three things differ from a taxon run:
+
+- **Nothing is downloaded and nothing is copied.** The image is opened where it
+  lies and `image_path` in the CSV is its absolute source path, not a path under
+  `results/`. A local run therefore writes only masks, overlays and cut-outs.
+- **The source images are never deleted**, including under `--discard-outputs`.
+- **The extension in the index may not be the one on disk.** Every `file_name`
+  says `.webp`; if that file is missing, `resolve_local` tries the same stem with
+  `jpg`, `jpeg`, `png`, `JPG`, `JPEG`, `PNG`, `gif` before recording the photo as
+  missing. Check what a batch folder actually holds if the failure count is high:
+  `ls $IMAGE_ROOT/phenobase_inat_data/images/medium/batch_1 | head`.
+
+`quality_grade`, `latitude` and `longitude` are blank in the results CSV — the
+annotation file does not carry them.
+
 ## 7. Open items
 
 - Run `slurm/test_2gpu.sbatch` to confirm two L4s run shards side by side,
