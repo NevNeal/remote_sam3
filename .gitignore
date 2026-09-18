@@ -1,11 +1,27 @@
-﻿*_segmentations/
+# Job logs and run outputs — these live on /blue, never in git
+logs/*
+!logs/.gitkeep
+results/
+*_segmentations/
+*_test/
+local_run_*/
 test_output/
-__pycache__/
-*.pyc
-instructions.md
+
+# iNat open-data source files and the parquet index (GB-scale)
+data/
+inat_db/
+*.parquet
+*.csv.gz
+
+# Local-only working notes
+HANDOFF.md
 PROJECT_SUMMARY.md
 design_doc.md
-.claude/
+instructions.md
+questions_for_chtc.md
 
-# iNat open-data files (large)
-inat_db/data/
+# Scratch
+__pycache__/
+*.pyc
+.conda/
+.claude/

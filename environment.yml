@@ -1,0 +1,15 @@
+# Conda environment for remote_sam3 on HiPerGator.
+#
+# Conda's only job here is to give us a clean Python 3.12 on /blue. Everything
+# else comes from pip (see requirements.txt) because PyTorch has to be pulled
+# from PyTorch's own cu128 wheel index, and because the package versions below
+# are the exact set already proven to work with facebook/sam3.
+#
+# Do not `conda env create -f` this by hand — run ./setup_env.sh, which creates
+# the env and then installs torch and requirements.txt in the right order.
+name: sam3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
