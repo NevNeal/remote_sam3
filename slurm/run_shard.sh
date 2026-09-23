@@ -7,9 +7,10 @@
 #     test_2gpu.sbatch   2 shards, 200 images, both GPUs at once
 #     array.sbatch       N shards, the whole taxon
 #     local.sbatch       N shards over images already on /blue (LOCAL_INDEX)
+#     b200.sbatch        1 B200, batched, one hour on the clock
 #
-# Inputs (environment): SHARD, NUM_SHARDS, and optionally LIMIT and OUT_DIR,
-# plus everything in settings.sh.
+# Inputs (environment): SHARD, NUM_SHARDS, and optionally LIMIT, OUT_DIR,
+# MAX_SECONDS and BF16, plus everything in settings.sh.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
@@ -76,13 +77,22 @@ else
     args=(--taxon-id "$TAXON_ID" --parquet "$PARQUET")
 fi
 args+=(
-    --out        "$OUT_DIR"
-    --prompt     "$PROMPT"
-    --min-score  "$MIN_SCORE"
-    --workers    "$WORKERS"
-    --shard      "$SHARD"
-    --num-shards "$NUM_SHARDS"
+    --out          "$OUT_DIR"
+    --prompt       "$PROMPT"
+    --min-score    "$MIN_SCORE"
+    --workers      "$WORKERS"
+    --batch-size   "$BATCH_SIZE"
+    --save-workers "$SAVE_WORKERS"
+    --shard        "$SHARD"
+    --num-shards   "$NUM_SHARDS"
 )
+# Timed test: stop the loop on the clock rather than at the end of the list.
+if [[ -n "${MAX_SECONDS:-}" ]]; then
+    args+=(--max-seconds "$MAX_SECONDS")
+fi
+if [[ -n "${BF16:-}" ]]; then
+    args+=(--bf16)
+fi
 # LIMIT takes the first N photos of the taxon BEFORE sharding, so
 # LIMIT=200 with 2 shards gives each shard 100.
 if [[ -n "${LIMIT:-}" ]]; then

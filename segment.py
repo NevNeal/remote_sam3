@@ -24,6 +24,16 @@ and no S3 (see load_local_photos):
         --out results/local_flower --prompt flower \\
         --shard 0 --num-shards 5
 
+One forward pass per image leaves a big GPU mostly idle. --batch-size pushes N
+images through together, which is what makes a B200 worth asking for, and
+--max-seconds stops the shard on a wall-clock budget instead of at the end of
+the list, for timed throughput tests:
+
+    python segment.py --local-index data/local_image_paths.parquet \\
+        --image-root /home/neal.nevyn/blue_guralnick/share \\
+        --out results/b200_flower --prompt flower --bf16 \\
+        --batch-size 32 --save-workers 16 --max-seconds 3600
+
 Output layout (shared by all shards of a run):
 
     <out>/images/batch_00001/Genus_species_<photo_id>.jpg
@@ -40,9 +50,12 @@ import json
 import os
 import platform
 import re
+import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+from itertools import islice
 from pathlib import Path
 
 import numpy as np
@@ -61,9 +74,12 @@ PHOTO_URL = "https://inaturalist-open-data.s3.amazonaws.com/photos/{photo_id}/or
 # taxon is hundreds of thousands of files, and Lustre does not enjoy one flat dir.
 BATCH_SIZE = 1000
 
-# How many downloaded images to hold in memory before segmenting them. Bigger
-# means the GPU waits less at chunk boundaries and more RAM is used.
-CHUNK = 64
+# How deep the pipeline runs, as multiples of the batch size: how many photos may
+# sit decoded in memory ahead of the GPU, and how many may be waiting to be
+# written behind it. Both are bounded because every photo in flight holds a
+# full-resolution image, and a B200 batch of 64 is a lot of megapixels.
+PREFETCH_BATCHES = 3
+SAVE_BATCHES = 4
 
 # The local index records every path as .webp, but what is actually on disk may
 # have kept its original extension. Try the recorded name, then these.
@@ -287,6 +303,32 @@ def fetch_local(row):
     return row, image, None, info
 
 
+def _prefetch(rows, fetch_one, workers, depth):
+    """Yield (row, image, error, info) in order, keeping `depth` reads in flight.
+
+    Submitting every row at once would decode the whole shard into RAM, and
+    fetching a fixed chunk and then segmenting it leaves the GPU idle at every
+    chunk boundary. This holds the readers a constant distance ahead instead, so
+    the next batch is already decoded when the last one leaves the GPU.
+
+    info["wait_s"] is how long the consumer actually blocked on this photo — GPU
+    idle time caused by reading, which is the number that says whether `workers`
+    is high enough.
+    """
+    rows = iter(rows)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque(pool.submit(fetch_one, row) for row in islice(rows, depth))
+        while pending:
+            future = pending.popleft()
+            nxt = next(rows, None)
+            if nxt is not None:
+                pending.append(pool.submit(fetch_one, nxt))
+            waited = time.perf_counter()
+            row, image, error, info = future.result()
+            info["wait_s"] = round(time.perf_counter() - waited, 4)
+            yield row, image, error, info
+
+
 # -- Stage 3: mask bookkeeping ------------------------------------------------
 
 def to_binary(mask, size):
@@ -376,11 +418,16 @@ def _label(draw, x, y, text, font):
 
 class Results:
     """Append-only per-shard CSV. One row per photo, written as we go, so a job
-    killed at its walltime loses nothing but the image in flight."""
+    killed at its walltime loses nothing but the image in flight.
+
+    The writes are locked because the saver threads call them: two threads
+    appending to one file would interleave half-written lines, which is the same
+    corruption that gives every shard its own CSV in the first place."""
 
     def __init__(self, path, err_path):
         self.path = path
         self.err_path = err_path
+        self.lock = threading.Lock()
         if not path.exists() or path.stat().st_size == 0:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -395,12 +442,70 @@ class Results:
             return set()
 
     def write(self, **fields):
-        with open(self.path, "a", newline="", encoding="utf-8") as handle:
-            csv.writer(handle).writerow([fields.get(c, "") for c in CSV_COLUMNS])
+        row = [fields.get(c, "") for c in CSV_COLUMNS]
+        with self.lock, open(self.path, "a", newline="", encoding="utf-8") as handle:
+            csv.writer(handle).writerow(row)
 
     def note_error(self, message):
-        with open(self.err_path, "a", encoding="utf-8") as handle:
+        with self.lock, open(self.err_path, "a", encoding="utf-8") as handle:
             handle.write(message.rstrip() + "\n")
+
+
+class Saver:
+    """Writes each photo's outputs on a worker thread, and owns every piece of
+    bookkeeping the threads share.
+
+    Saving a photo is PNG encoding plus a dozen small writes: hundreds of
+    milliseconds of CPU. One image per forward pass hides that behind the next
+    read, but a B200 finishes a batch of 32 faster than one thread can write it,
+    and the GPU ends up waiting on Pillow. `depth` bounds how many photos may be
+    in flight, because each one holds its decoded image and its masks in memory
+    until it has been written.
+
+    workers=1 runs everything on the calling thread — exactly what the
+    single-image path did before there was a Saver.
+    """
+
+    def __init__(self, workers, depth, results, tally, progress):
+        self.results, self.tally, self.progress = results, tally, progress
+        self.pool = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+        self.slots = threading.Semaphore(depth)
+        self.lock = threading.Lock()
+        self.gpu_s = 0.0
+
+    def submit(self, fn, *args):
+        if self.pool is None:
+            fn(*args)
+            return
+        self.slots.acquire()         # blocks the GPU loop once `depth` are queued
+        self.pool.submit(self._run, fn, *args)
+
+    def _run(self, fn, *args):
+        try:
+            fn(*args)
+        except Exception as exc:
+            # Deliberately no CSV row: a photo whose outputs did not get written
+            # is not done, and the next run should pick it up again.
+            self.results.note_error(f"[save] {exc}")
+            self.bump("save_failed")
+        finally:
+            self.slots.release()
+
+    def record(self, key, fields):
+        """One CSV row, one tally bump, one tick of the bar, for one photo."""
+        self.results.write(**fields)
+        with self.lock:
+            self.gpu_s += float(fields.get("infer_s") or 0)
+        self.bump(key)
+
+    def bump(self, key):
+        with self.lock:
+            self.tally[key] = self.tally.get(key, 0) + 1
+            self.progress.update(1)
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
 
 
 def main():
@@ -455,34 +560,68 @@ def main():
         session = make_session(args.workers)
         fetch_one = lambda row: fetch(session, row, _image_path(out, row))
 
-    tally = {"ok": 0, "no_detections": 0, "download_failed": 0, "segment_failed": 0}
+    tally = {"ok": 0, "no_detections": 0, "download_failed": 0,
+             "segment_failed": 0, "save_failed": 0}
     rows = todo.to_dict("records")
     progress = tqdm(total=len(rows), desc=f"shard {args.shard}", dynamic_ncols=True)
+    saver = Saver(args.save_workers, max(8, args.batch_size * SAVE_BATCHES),
+                  results, tally, progress)
+    depth = args.workers + args.batch_size * PREFETCH_BATCHES
+    print(f"pipeline   : batch {args.batch_size}, {args.workers} readers {depth} deep,"
+          f" {args.save_workers} savers"
+          + (f", stop after {args.max_seconds:.0f}s" if args.max_seconds else ""))
 
-    # Download a chunk in parallel, then segment that chunk one image at a time.
-    # The GPU idles briefly at each chunk boundary; in exchange the control flow
-    # is obvious and memory is bounded. wait_s records exactly how long.
+    # Read ahead, segment a batch at a time, write behind. The three stages
+    # overlap, so the GPU is only idle when the readers fall behind (wait_s) or
+    # the savers back up (the Saver's semaphore).
     loop_started = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for start in range(0, len(rows), CHUNK):
-            chunk = rows[start:start + CHUNK]
-            fetched = pool.map(fetch_one, chunk)
-            while True:
-                waited = time.perf_counter()
-                try:
-                    row, image, error, info = next(fetched)
-                except StopIteration:
-                    break
-                info["wait_s"] = round(time.perf_counter() - waited, 4)
-                _handle(row, image, error, info, out, model, processor,
-                        device, args, results, tally, progress)
+    deadline = loop_started + args.max_seconds if args.max_seconds else None
+    stopped_early = False
+    batch = []
+    reader = _prefetch(rows, fetch_one, args.workers, depth)
+    try:
+        for row, image, error, info in reader:
+            if image is None:
+                _handle(row, None, error, info, out, model, processor, device,
+                        args, results, tally, progress, saver)
+            elif args.batch_size > 1:
+                batch.append((row, image, info))
+                if len(batch) >= args.batch_size:
+                    _run_batch(batch, out, model, processor, device, args,
+                               results, tally, progress, saver)
+                    batch = []
+            else:
+                _handle(row, image, None, info, out, model, processor, device,
+                        args, results, tally, progress, saver)
+            if deadline is not None and time.perf_counter() >= deadline:
+                stopped_early = True
+                break
+        # Whatever is already decoded gets segmented, deadline or not: it is one
+        # more forward pass, and dropping it would mean re-reading those images.
+        if batch:
+            _run_batch(batch, out, model, processor, device, args,
+                       results, tally, progress, saver)
+    finally:
+        # Stopping on the clock leaves reads in flight; close the generator so
+        # its pool shuts down here rather than whenever it is collected.
+        reader.close()
+        # The GPU is done but photos are still being written, and their CSV rows
+        # belong to this run, so loop_s has to include the drain.
+        saver.close()
     loop_s = time.perf_counter() - loop_started
 
     progress.close()
+    photos_done = sum(tally.values())
     print(f"\nshard {args.shard} done: " +
           "  ".join(f"{k}={v:,}" for k, v in tally.items()))
-    print(f"loop       : {loop_s:.1f}s for {len(rows):,} photos"
-          f" ({len(rows) / loop_s:.2f} photos/s)" if loop_s else "")
+    if stopped_early:
+        print(f"stopped    : --max-seconds {args.max_seconds:.0f} reached,"
+              f" {len(rows) - photos_done:,} of this shard's photos untouched")
+    if loop_s:
+        print(f"loop       : {loop_s:.1f}s for {photos_done:,} photos"
+              f" ({photos_done / loop_s:.2f} photos/s)")
+        print(f"gpu        : {saver.gpu_s:.1f}s in forward passes"
+              f" ({100 * saver.gpu_s / loop_s:.0f}% of the loop)")
     print(f"results: {results.path}")
 
     # Shard-level phases, for the benchmark report. Per-photo detail is in the CSV.
@@ -492,10 +631,14 @@ def main():
         "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
         "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "workers": args.workers, "chunk": CHUNK, "discard_outputs": args.discard_outputs,
+        "workers": args.workers, "batch_size": args.batch_size,
+        "prefetch": depth, "save_workers": args.save_workers, "bf16": args.bf16,
+        "discard_outputs": args.discard_outputs,
+        "max_seconds": args.max_seconds, "stopped_early": stopped_early,
         "started_at": shard_started, "finished_at": time.time(),
         "parquet_s": round(parquet_s, 2), "model_load_s": round(model_load_s, 2),
-        "loop_s": round(loop_s, 2), "photos": len(rows), "resumed_from": len(done),
+        "loop_s": round(loop_s, 2), "gpu_infer_s": round(saver.gpu_s, 2),
+        "photos": photos_done, "photos_todo": len(rows), "resumed_from": len(done),
         "tally": tally,
     }
     (out / f"timing_shard_{args.shard:03d}.json").write_text(json.dumps(timing, indent=2))
@@ -511,9 +654,24 @@ def _image_path(out, row):
     return out / "images" / row["batch"] / f"{row['stem']}.{ext}"
 
 
+def _run_batch(batch, out, model, processor, device, args, results, tally, progress, saver):
+    """One forward pass over a whole batch, then one CSV row per photo in it."""
+    outcomes = segment_batch(model, processor, [image for _, image, _ in batch],
+                             args.prompt, args.min_score, device, args.bf16)
+    for (row, image, info), outcome in zip(batch, outcomes):
+        _handle(row, image, None, info, out, model, processor, device,
+                args, results, tally, progress, saver, outcome=outcome)
+
+
 def _handle(row, image, error, info, out, model, processor, device,
-            args, results, tally, progress):
-    """Segment one image and record exactly one CSV row for it."""
+            args, results, tally, progress, saver, outcome=None):
+    """Account for exactly one photo: segment it if nobody else has, then hand
+    it to the saver.
+
+    `outcome` is the (masks, scores, stages) a batched forward pass already
+    produced for this photo, or the exception that batch raised for it. Left
+    None, the photo is segmented here, one image per forward pass.
+    """
     image_path = _image_path(out, row)
     common = {
         "photo_id": row["photo_id"], "taxon_id": row["taxon_id"],
@@ -527,29 +685,43 @@ def _handle(row, image, error, info, out, model, processor, device,
     }
 
     if image is None:
-        tally["download_failed"] += 1
-        results.write(status="download_failed", num_masks=0, error=error,
-                      done_at=f"{time.time():.3f}", **common)
+        saver.record("download_failed",
+                     dict(status="download_failed", num_masks=0, error=error,
+                          done_at=f"{time.time():.3f}", **common))
         results.note_error(f"[download] photo_id={row['photo_id']} {error}")
-        progress.update(1)
         return
 
     common.update(width=image.size[0], height=image.size[1])
     started = time.perf_counter()
-    try:
-        masks, scores, stages = segment(model, processor, image, args.prompt,
-                                        args.min_score, device, args.bf16)
-    except Exception as exc:
-        tally["segment_failed"] += 1
-        results.write(status="segment_failed", num_masks=0, error=str(exc),
-                      seconds=f"{time.perf_counter() - started:.3f}",
-                      done_at=f"{time.time():.3f}", **common)
-        results.note_error(f"[segment] photo_id={row['photo_id']} {exc}")
+    if outcome is None:
+        try:
+            outcome = segment(model, processor, image, args.prompt,
+                              args.min_score, device, args.bf16)
+        except Exception as exc:
+            outcome = exc
+
+    if isinstance(outcome, Exception):
+        saver.record("segment_failed",
+                     dict(status="segment_failed", num_masks=0, error=str(outcome),
+                          seconds=f"{time.perf_counter() - started:.3f}",
+                          done_at=f"{time.time():.3f}", **common))
+        results.note_error(f"[segment] photo_id={row['photo_id']} {outcome}")
         if args.discard_outputs and not row.get("local_path"):
             _discard([image_path])
-        progress.update(1)
         return
 
+    masks, scores, stages = outcome
+    saver.submit(_save_photo, row, image, image_path, masks, scores, stages,
+                 common, out, args, saver)
+
+
+def _save_photo(row, image, image_path, masks, scores, stages, common, out, args, saver):
+    """Write one photo's masks, cut-outs and overlay, then its CSV row.
+
+    Runs on a Saver thread. Everything the GPU had to be present for is already
+    done — this is PNG encoding and file writes, and the next batch should not
+    be waiting behind it.
+    """
     saving = time.perf_counter()
     stem = row["stem"]
     written = []
@@ -569,14 +741,13 @@ def _handle(row, image, error, info, out, model, processor, device,
         rgbs.append(avg_rgb(image, mask))
 
     overlay_rel = ""
+    status_key = "no_detections"
     if masks:
         overlay = out / "overlays" / row["batch"] / f"{stem}_overlay.png"
         save_overlay(image, masks, scores, args.prompt, overlay)
         overlay_rel = str(overlay.relative_to(out))
         written.append(overlay)
-        tally["ok"] += 1
-    else:
-        tally["no_detections"] += 1
+        status_key = "ok"
     save_s = time.perf_counter() - saving
 
     # What this photo would cost on disk if kept: the downloaded image plus
@@ -586,19 +757,22 @@ def _handle(row, image, error, info, out, model, processor, device,
         # In local mode the image is the source data on /blue, not ours to delete.
         _discard(written if row.get("local_path") else written + [image_path])
 
-    results.write(
+    # prep + infer + post + save, as the CSV's header comment promises. Summed
+    # from the stages rather than wall-clocked, so a batched photo gets its own
+    # share and not the whole batch's.
+    seconds = save_s + sum(float(stages[k]) for k in ("prep_s", "infer_s", "post_s"))
+
+    saver.record(status_key, dict(
         status="ok", num_masks=len(masks),
         overlay_path=overlay_rel,
         mask_paths=";".join(mask_paths),
         segment_paths=";".join(segment_paths),
         mask_scores=",".join(f"{s:.4f}" for s in scores),
         mask_avg_rgb=";".join(rgbs),
-        seconds=f"{time.perf_counter() - started:.3f}",
+        seconds=f"{seconds:.3f}",
         save_s=f"{save_s:.4f}", output_bytes=output_bytes,
         done_at=f"{time.time():.3f}",
-        **stages, **common,
-    )
-    progress.update(1)
+        **stages, **common))
 
 
 def _relative(path, out):
@@ -620,14 +794,59 @@ def _discard(paths):
 
 
 def segment(model, processor, image, prompt, min_score, device, bf16):
-    """One SAM3 forward pass.
+    """One SAM3 forward pass over one image.
 
     Returns (masks, scores, stages): masks/scores sorted most-confident first,
     stages = {prep_s, infer_s, post_s} for the timing columns.
     """
+    return _forward_batch(model, processor, [image], prompt, min_score, device, bf16)[0]
+
+
+def segment_batch(model, processor, images, prompt, min_score, device, bf16):
+    """SAM3 over a list of images in one forward pass.
+
+    Returns one (masks, scores, stages) tuple per image, in the order given, or
+    that image's exception in its slot.
+
+    A batch that will not run is halved and retried rather than lost. How much
+    VRAM a batch needs depends on the resolutions in it, so the largest batch
+    that fits is not a constant, and one unlucky pair of 50-megapixel photos
+    should cost two forward passes rather than a whole shard. Splitting also
+    isolates a single corrupt image instead of failing the 31 beside it.
+    """
+    try:
+        return _forward_batch(model, processor, images, prompt, min_score, device, bf16)
+    except Exception as exc:
+        if len(images) == 1:
+            return [exc]
+        if not getattr(segment_batch, "warned", False):
+            segment_batch.warned = True
+            print(f"\nbatch of {len(images)} failed, halving and retrying: {exc}")
+            print("           if this keeps happening, --batch-size is too big for this"
+                  " GPU, or the processor will not collate these image sizes")
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        half = len(images) // 2
+        return (segment_batch(model, processor, images[:half],
+                              prompt, min_score, device, bf16)
+                + segment_batch(model, processor, images[half:],
+                                prompt, min_score, device, bf16))
+
+
+def _forward_batch(model, processor, images, prompt, min_score, device, bf16):
+    """The forward pass itself, over a list of images. Raises on failure.
+
+    prep_s and infer_s are each photo's share of the batch's preprocessing and
+    forward pass: the batch is indivisible, so there is no per-photo number to
+    report and the share is what keeps the CSV's columns summable. post_s is the
+    batch's share of post-processing plus this photo's own mask thresholding,
+    which genuinely is per-photo.
+    """
     cuda = device == "cuda"
+    n = len(images)
+
     t0 = time.perf_counter()
-    inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+    inputs = _processor_call(processor, images, prompt).to(device)
     if cuda:
         torch.cuda.synchronize()
     t1 = time.perf_counter()
@@ -647,26 +866,53 @@ def segment(model, processor, image, prompt, min_score, device, bf16):
         threshold=min_score,
         mask_threshold=MASK_THRESHOLD,
         target_sizes=inputs.get("original_sizes").tolist(),
-    )[0]
+    )
+    if len(detections) != n:
+        raise RuntimeError(f"post-processing returned {len(detections)} results "
+                           f"for a batch of {n}")
+    t3 = time.perf_counter()
 
+    prep_s, infer_s, post_s = (t1 - t0) / n, (t2 - t1) / n, (t3 - t2) / n
+    results = []
+    for image, detection in zip(images, detections):
+        started = time.perf_counter()
+        masks, scores = _keep_masks(detection, image.size, min_score)
+        results.append((masks, scores, {
+            "prep_s": f"{prep_s:.4f}",
+            "infer_s": f"{infer_s:.4f}",
+            "post_s": f"{post_s + time.perf_counter() - started:.4f}",
+        }))
+    return results
+
+
+def _processor_call(processor, images, prompt):
+    """The processor call for a batch.
+
+    SAM3's processor wants one text per image; a build that instead broadcasts a
+    single string rejects the list, so try the list first and fall back.
+    """
+    try:
+        return processor(images=images, text=[prompt] * len(images), return_tensors="pt")
+    except (TypeError, ValueError):
+        return processor(images=images, text=prompt, return_tensors="pt")
+
+
+def _keep_masks(detection, size, min_score):
+    """SAM3's raw output for one image -> (masks, scores), most confident first."""
     masks, kept = [], []
-    raw_masks = detections.get("masks")
-    raw_scores = detections.get("scores")
+    raw_masks = detection.get("masks")
+    raw_scores = detection.get("scores")
     if raw_masks is not None and raw_scores is not None and len(raw_scores):
         scores = [float(s) for s in raw_scores]
         pairs = sorted(zip(raw_masks, scores), key=lambda pair: pair[1], reverse=True)
         for mask, score in pairs:
             if score < min_score:
                 continue
-            binary = to_binary(mask, image.size)
+            binary = to_binary(mask, size)
             if binary.any():
                 masks.append(binary)
                 kept.append(score)
-    t3 = time.perf_counter()
-
-    stages = {"prep_s": f"{t1 - t0:.4f}", "infer_s": f"{t2 - t1:.4f}",
-              "post_s": f"{t3 - t2:.4f}"}
-    return masks, kept, stages
+    return masks, kept
 
 
 def parse_args():
@@ -685,7 +931,20 @@ def parse_args():
                         help="Discard detections below this confidence")
     parser.add_argument("--shard", type=int, default=0, help="This worker's shard index")
     parser.add_argument("--num-shards", type=int, default=1, help="Total shards in the run")
-    parser.add_argument("--workers", type=int, default=16, help="Parallel image downloads")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="Threads reading images ahead of the GPU")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Images per forward pass. 1 is one at a time, which is "
+                             "all an L4 has room for; 8-64 is what makes a B200 worth "
+                             "asking for. A batch that will not fit is halved and retried.")
+    parser.add_argument("--save-workers", type=int, default=1,
+                        help="Threads writing masks, cut-outs and overlays. 1 writes them "
+                             "on the main thread and the GPU waits; raise it whenever "
+                             "--batch-size is raised.")
+    parser.add_argument("--max-seconds", type=float, default=None,
+                        help="Stop the segmentation loop after this many seconds, for "
+                             "timed throughput tests. Everything finished is kept, and "
+                             "the rest is picked up by the next run's resume.")
     parser.add_argument("--limit", type=int, default=None,
                         help="Use only the first N photos of the taxon (for testing)")
     parser.add_argument("--bf16", action="store_true",
@@ -702,6 +961,9 @@ def parse_args():
         parser.error("--taxon-id and --parquet are required "
                      "(or use --local-index with --image-root)")
     args.num_shards = max(1, args.num_shards)
+    args.batch_size = max(1, args.batch_size)
+    args.workers = max(1, args.workers)
+    args.save_workers = max(1, args.save_workers)
     return args
 
 

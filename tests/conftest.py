@@ -3,8 +3,10 @@ Shared fixtures for the download-path tests: reading photo rows out of the
 parquet index (segment.load_photos) and fetching them from the iNat open-data
 S3 bucket (segment.fetch / make_session).
 
-These stages need no GPU, so torch and transformers are stubbed when they are
-not installed. That lets the tests run on a laptop or a login node; in the real
+The batching tests are here too: batch collation and the split-and-retry are
+plain control flow around the model, so a fake model exercises them exactly as
+the real one would. None of this needs a GPU, so torch and transformers are
+stubbed when they are not installed. That lets the tests run on a laptop or a login node; in the real
 sam3 env the genuine packages are imported instead.
 
     pytest tests/                    # everything, including live S3 requests
@@ -12,6 +14,7 @@ sam3 env the genuine packages are imported instead.
     INAT_PARQUET=data/inat_photos.parquet pytest tests/ -m real_index
 """
 
+import contextlib
 import importlib
 import os
 import sys
@@ -35,7 +38,17 @@ def _stub_missing_gpu_stack():
     except ImportError:
         pass
     torch = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(is_available=lambda: False, synchronize=lambda: None)
+    oom = type("OutOfMemoryError", (RuntimeError,), {})
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: False, synchronize=lambda: None,
+        empty_cache=lambda: None, OutOfMemoryError=oom)
+    torch.OutOfMemoryError = oom
+    # Enough of the inference-time API for segment._forward_batch to run against
+    # a fake model on a laptop: both are context managers and neither does
+    # anything without a GPU.
+    torch.inference_mode = contextlib.nullcontext
+    torch.autocast = lambda *args, **kwargs: contextlib.nullcontext()
+    torch.bfloat16 = "bfloat16"
     torch.Tensor = type("Tensor", (), {})
     sys.modules["torch"] = torch
     transformers = types.ModuleType("transformers")

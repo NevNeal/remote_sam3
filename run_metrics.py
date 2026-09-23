@@ -266,7 +266,11 @@ def setup(photos, shards):
         "gpus": shards["gpu"].value_counts().to_dict() if "gpu" in shards else {},
         "distinct_gpu_uuids": int(shards["gpu_uuid"].nunique()) if "gpu_uuid" in shards else None,
         "workers": first.get("workers"),
-        "chunk": first.get("chunk"),
+        "batch_size": first.get("batch_size", 1),
+        "save_workers": first.get("save_workers", 1),
+        "bf16": bool(first.get("bf16")),
+        "max_seconds": first.get("max_seconds"),
+        "stopped_early": bool(first.get("stopped_early")),
         "discard_outputs": first.get("discard_outputs"),
         "slurm_jobs": sorted({str(v) for v in shards.get("slurm_array_job_id",
                               pd.Series(dtype=str)).dropna()}),
@@ -429,10 +433,16 @@ def render(s, per_shard, photos):
           f"  shards {su['shards']} on {len(su['hosts'])} host(s): {', '.join(su['hosts']) or '?'}",
           f"  gpus   " + ", ".join(f"{n}x {g}" for g, n in su["gpus"].items())
           + (f"  ({su['distinct_gpu_uuids']} distinct GPU UUIDs)" if su["distinct_gpu_uuids"] else ""),
-          f"  images {rd['source']};  workers {su['workers']}, chunk {su['chunk']}"
+          f"  images {rd['source']};  batch {su['batch_size']}, "
+          f"{su['workers']} readers, {su['save_workers']} savers"
           + (f";  resumed {su['resumed_photos']:,}" if su["resumed_photos"] else ""),
+          (f"  timed  stopped at --max-seconds {su['max_seconds']:.0f}"
+           " - the photo count below is what fit in that budget"
+           if su["stopped_early"] else None),
           f"  slurm  {', '.join(su['slurm_jobs']) or '-'}"
           + ("" if tp["sacct_available"] else "  (sacct not available - allocated/RSS/CPU blank)")]
+
+    L = [line for line in L if line is not None]
 
     L += ["", "-- throughput " + "-" * 57,
           f"  wall clock          {hms(tp['wall_clock_s'])}   "
