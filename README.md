@@ -12,7 +12,8 @@ build_index.py     make the metadata index (once, then monthly)
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
 run_metrics.py     detailed timing, GPU, detection and cost metrics for a run
-tests/             pytest: parquet -> shard rows -> S3 download, no GPU needed
+sweep_batch.py     which batch size saturates this GPU? run before a B200 run
+tests/             pytest: parquet -> shard rows -> S3 download, batching. No GPU
 setup_env.sh       create the conda env from environment.yml, cache the model
 environment.yml    the HiPerGator conda env: python 3.12 + torch cu128 + pins
 requirements.txt   pip packages, pinned (pulled in by environment.yml)
@@ -21,6 +22,7 @@ slurm/run_shard.sh one shard on one GPU — what every GPU job runs
 slurm/bench.sh     benchmark a taxon: timed run + report, outputs deleted
 bench_report.py    turns a benchmark's raw timing into report.md
 slurm/*.sbatch     the jobs: test (1 GPU), test_2gpu (2 GPUs), array (N GPUs),
+                   local (N GPUs over /blue), b200 + b200_sweep (one B200),
                    build_index (CPU)
 ```
 
@@ -234,20 +236,34 @@ help a GPU that's already waiting.
 The ceiling is iNat's S3 tolerance, not the node. If `download_failed` starts
 climbing and the errors mention 429s, you've gone too far; back off.
 
-### Axis 3 — bigger GPUs (not yet worth it)
+### Axis 3 — bigger GPUs, fed a batch at a time
 
-`hpg-b200` gives you 180 GB of VRAM per GPU. SAM3 on a single image uses about
-4 GB of it. So the B200s buy you very little today, while being the contended
-partition that RC asks you to reserve for work that genuinely needs the VRAM.
-Sixty L4s you get in minutes beat eight B200s you wait a day for.
+`hpg-b200` gives you 180 GB of VRAM per GPU. SAM3 on a *single* image uses about
+4 GB of it, which is why the B200s used to buy you nothing: at one image per
+forward pass they are an L4 with 156 GB spare, on the contended partition RC asks
+you to reserve for work that genuinely needs the VRAM.
 
-**What would change that: batched inference.** `segment.py` runs one image per
-forward pass, inherited from the original pipeline. Batching 8–32 images per
-`model(**inputs)` call is where the remaining 3–10× lives, and it's the thing
-that would make a 180 GB GPU make sense. It needs same-size padding and
-collation in the processor call plus per-image un-padding in post-processing, so
-it's a real change rather than a flag. Worth doing after the first full run tells
-you where the time actually goes.
+`--batch-size N` is what changes that. N images go through one `model(**inputs)`
+call, so the GPU gets a wide tensor instead of a narrow one and the fixed cost of
+a forward pass is paid once for N photos instead of N times. With
+`--save-workers` raised to match, and `--bf16`, this is the 3–10× that was the
+last thing left on the table.
+
+Three things that go with it:
+
+- **VRAM headroom is not a constant.** It scales with the resolutions in the
+  batch, so the largest batch that fits varies from batch to batch. A batch that
+  will not run is halved and retried rather than lost, down to single images.
+- **Raise `--save-workers` with `--batch-size`.** A batch of 32 arrives every
+  second or so and each photo is a few hundred ms of PNG encoding. One writing
+  thread becomes the bottleneck immediately, and then you are benchmarking
+  Pillow.
+- **Measure before committing an hour.** `sweep_batch.py` times the real forward
+  pass at each batch size and dtype on one pool of images — see §6d.
+
+Sixty L4s you get in minutes still beat eight B200s you wait a day for, for a
+whole-taxon run. One B200 is the right tool for the images already on /blue,
+where there is no download to hide behind and the GPU is the only thing working.
 
 ### Not worth doing
 
@@ -523,12 +539,126 @@ Three things differ from a taxon run:
 `quality_grade`, `latitude` and `longitude` are blank in the results CSV — the
 annotation file does not carry them.
 
+## 6d. One B200: batched, and timed
+
+The question: **how many of the images already on /blue can a single B200 segment
+in an hour?** One GPU, not an array — the per-GPU number is what a later array
+multiplies, and it is the number that decides whether the whole 2.8 M is a
+weekend or a fortnight.
+
+### Step 1 — find the batch size (10–20 minutes)
+
+```bash
+sbatch slurm/b200_sweep.sbatch
+# BATCH_SIZES=1,8,32,64,128 POOL=256 sbatch slurm/b200_sweep.sbatch
+```
+
+It decodes one pool of images, then times the real forward pass over them at
+each batch size in fp32 and bf16. Nothing is written and nothing is saved, so
+what it reports is the GPU's ceiling:
+
+```
+ batch  dtype  images/s  s/batch  peak VRAM  of GPU
+----------------------------------------------------
+     1   fp32      1.05    0.952       4.1G      2%
+    32   fp32     11.80    2.712      78.4G     44%
+    32   bf16     21.40    1.495      41.9G     23%
+    64   bf16       OOM    ...
+```
+
+(Illustrative numbers — the point is the shape, and the last line is where the
+GPU stops.) It ends with the line to run next:
+
+```
+best       : batch 32 bf16, 21.40 images/s, 20.4x batch 1 at the same dtype
+             BATCH_SIZE=32 BF16=1 sbatch slurm/b200.sbatch
+```
+
+The sweep is the cheap way to be wrong: an hour at the wrong batch size costs an
+hour of a contended partition.
+
+### Step 2 — the hour
+
+```bash
+BATCH_SIZE=32 BF16=1 sbatch slurm/b200.sbatch
+```
+
+Defaults: `hpg-b200`, 1 GPU, 14 cores, 240 GB, `MAX_SECONDS=3600`,
+`BATCH_SIZE=32`, `SAVE_WORKERS=10`, `WORKERS=16`, `BF16=1`, `DISCARD=1`,
+`OUT_DIR=results/b200_flower`. Walltime is 1h30 for a 1h loop: the model takes
+60–90 s to load and the writers drain after the deadline.
+
+`MAX_SECONDS` stops the **segmentation loop** on the clock rather than at the end
+of the list. Everything finished is in the CSV, and because resume is per-shard
+and by `photo_id`, a second run picks up exactly where this one stopped — the
+hour is a sample, not a throwaway.
+
+`DISCARD=1` writes every mask, overlay and cut-out, measures it, and deletes it
+immediately, so the timing and the storage estimate are real while the hour costs
+almost nothing on /blue. **`DISCARD= sbatch slurm/b200.sbatch` keeps them** — but
+then you are also measuring how fast Lustre takes a few hundred thousand PNGs.
+
+The job ends by running `run_metrics.py` itself, so the answer is at the bottom
+of `logs/sam3_b200-<jobid>.out`:
+
+```
+shard 0 done: ok=64,120  no_detections=8,904  download_failed=12  segment_failed=0  save_failed=0
+stopped    : --max-seconds 3600 reached, 2,776,506 of this shard's photos untouched
+loop       : 3604.8s for 73,036 photos (20.26 photos/s)
+gpu        : 2841.3s in forward passes (79% of the loop)
+```
+
+That last line is the one to read. **79% means the GPU was the bottleneck** and
+the number is real. Much below ~60% and the hour measured something else:
+
+| symptom | what it means | what to change |
+|---|---|---|
+| high `wait_s` in the CSV | the readers cannot keep Lustre ahead of the GPU | raise `WORKERS` |
+| high `save_s`, low `gpu` % | Pillow is the bottleneck | raise `SAVE_WORKERS`, or `DISCARD=1` |
+| "batch of N failed, halving" in the log | batches are not collating, or N is too big | drop `BATCH_SIZE` to what the sweep proved |
+| `download_failed` climbing | files missing under `IMAGE_ROOT` | check a batch folder's real extensions (§6c) |
+
+### What the pipeline is doing
+
+Three stages overlap, and each one is bounded so nothing runs away with the
+node's memory:
+
+```
+ readers (WORKERS)        GPU (BATCH_SIZE)         writers (SAVE_WORKERS)
+ open + decode  ──────▶  one forward pass  ──────▶  masks, cut-outs, overlay
+ from /blue               per BATCH_SIZE            then the CSV row
+ stays 3 batches ahead                              at most 4 batches behind
+```
+
+The GPU is idle only when the readers fall behind — which is `wait_s` in the
+CSV — or when the writers back up. A photo's CSV row is written *after* its files
+are, so a job killed mid-write leaves that photo un-recorded and the next run
+redoes it, rather than recording a photo whose outputs do not exist.
+
+### Scaling it up
+
+Once the hour gives you a per-GPU rate, the array arithmetic from §4 applies
+unchanged, with B200s in place of L4s:
+
+```
+GPU-hours ≈ 2,849,542 ÷ images_per_second ÷ 3600
+```
+
+Check what your group can actually have first — `slurmInfo`, and
+`sinfo -p hpg-b200 -o '%P %a %l %D %t %G'` for what is idle. Eight B200s per
+node and ~504 in the cluster is a much smaller pool than the ~600 L4s, and the
+investment QOS is the real ceiling.
+
 ## Tests
 
-`tests/` covers the download path: reading a shard's rows out of the parquet
+`tests/` covers the download path — reading a shard's rows out of the parquet
 index (`load_photos`) and fetching them from the open-data bucket (`fetch`,
-`make_session`). No GPU or model is needed; torch and transformers are stubbed
-if missing, so this runs on a login node or a laptop.
+`make_session`) — and the batching in `tests/test_batch.py`: that N images make
+one forward pass, that each photo gets its share of that pass in the timing
+columns, that a batch too big to run is halved rather than lost, and that the
+read-ahead stays in order and bounded. No GPU or model is needed; torch and
+transformers are stubbed if missing and the batching tests run against a fake
+model, so all of this runs on a login node or a laptop.
 
 ```bash
 pip install pytest                                   # once, into the sam3 env
@@ -548,9 +678,14 @@ six real California poppy photos (two stored as `.jpeg`) plus synthetic rows.
   concurrent shards.
 - `--cpus-per-task` / `WORKERS` are conservative first guesses against
   `hpg-turin`'s 32 cores per GPU. Tune with `collect.py`'s median-seconds output.
-- Batched inference (§4, Axis 3) is the highest-value remaining change.
-- `--bf16` exists on `segment.py` but is off by default, since it changes mask
-  numerics slightly and runs so far have been fp32.
+- Batched inference is in (§4 Axis 3, §6d) but has not been run on real
+  hardware yet: `slurm/b200_sweep.sbatch` first, then `slurm/b200.sbatch`.
+- `--bf16` is off by default, since it changes mask numerics slightly and runs so
+  far have been fp32. `slurm/b200.sbatch` turns it on, because on Blackwell it is
+  most of the speedup; if the masks matter more than the hour, set `BF16=`.
+- Whether SAM3's processor collates different-sized images into one batch, or
+  whether the batch has to be split every time, is unverified — the sweep's
+  output says which immediately.
 
 ---
 
