@@ -27,7 +27,7 @@ set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 source slurm/settings.sh
 
-CSV="${CSV:-/home/neal.nevyn/blue_guralnick/share/r.dinnage/Projects/phenovision/output/production_datasets/2026-03-15/production_datasets/2026-03-15/annotations_ingest_all_repro-v1.1.0_leaves-v1.0.0_2026-03-15.csv}"
+CSV="${CSV:-/home/neal.nevyn/blue_guralnick/share/r.dinnage/Projects/phenovision/output/production_datasets/2026-03-15/annotations_ingest_all_repro-v1.1.0_leaves-v1.0.0_2026-03-15.csv}"
 PUSH="${PUSH:-1}"
 name="$(basename "$CSV" .csv)"
 SUMMARY_DIR="${SUMMARY_DIR:-csv_summaries/$name}"
