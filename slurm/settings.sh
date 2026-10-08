@@ -44,6 +44,10 @@ export HF_HOME="${HF_HOME:-${PROJECT}/hf_cache}"
 LOCAL_INDEX="${LOCAL_INDEX:-}"
 IMAGE_ROOT="${IMAGE_ROOT:-/home/neal.nevyn/blue_guralnick/share}"
 
+# The phenovision annotations: which photos have a flower, by photo_id
+# (observedImageGuid). build_taxon_index.py joins a taxon's photos against it.
+ANNOTATIONS="${ANNOTATIONS:-${IMAGE_ROOT}/r.dinnage/Projects/phenovision/output/production_datasets/2026-03-15/annotations_internal_all_repro-v1.1.0_leaves-v1.0.0_2026-03-15.csv}"
+
 # ── What to segment ──────────────────────────────────────────────────────────
 TAXON_ID="${TAXON_ID:-160559}"
 PROMPT="${PROMPT:-flower}"

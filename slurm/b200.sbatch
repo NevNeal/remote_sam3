@@ -71,6 +71,11 @@ export OUT_DIR="${caller_out_dir:-${RESULTS}/b200_${PROMPT// /_}}"
 
 bash "$SLURM_SUBMIT_DIR/slurm/run_shard.sh"
 
+# run_shard.sh activated the env in its own shell; this one needs it too.
+module purge
+module load conda
+set +u; conda activate "$CONDA_ENV"; set -u
+
 # The answer, without waiting for run_metrics.py:
 echo
 echo "== one B200, ${MAX_SECONDS}s =="

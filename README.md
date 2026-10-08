@@ -9,6 +9,7 @@ Docker, no containers, no file staging.
 
 ```
 build_index.py     make the metadata index (once, then monthly)
+build_taxon_index.py  one taxon's flower-detected photos already on /blue
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
 run_metrics.py     detailed timing, GPU, detection and cost metrics for a run
@@ -651,23 +652,44 @@ Check what your group can actually have first — `slurmInfo`, and
 node and ~504 in the cluster is a much smaller pool than the ~600 L4s, and the
 investment QOS is the real ceiling.
 
-## 6e. A whole taxon on one B200, masks only — then render, then export
+## 6e. A taxon's on-disk flower photos on one B200, masks only — then render, then export
 
-Three separate jobs, in order. Only the first needs a GPU.
+Four jobs, in order. Only the second needs a GPU.
 
 ```bash
-LIMIT=2000 OUT_DIR=results/62741_smoke sbatch slurm/b200_taxon.sbatch   # 10-min check
-sbatch slurm/b200_taxon.sbatch                 # 1. taxon 62741: masks only, B200
-sbatch --array=0-19 slurm/render.sbatch        # 2. overlays + cut-outs, 20 CPU tasks
-sbatch slurm/pack_masks.sbatch                 # 3. masks -> export/62741_flower/*.tar.zst
+jid=$(sbatch --parsable slurm/build_taxon_index.sbatch)          # 0. CPU: which photos, which files
+sbatch --dependency=afterok:$jid slurm/b200_taxon.sbatch         # 1. B200: masks only
+sbatch --array=0-9 slurm/render.sbatch                           # 2. CPU: overlays + cut-outs
+sbatch slurm/pack_masks.sbatch                                   # 3. CPU: masks -> .tar.zst
 ```
 
-**1. `b200_taxon.sbatch`** downloads every photo of `TAXON_ID` (default 62741)
-from S3 into `results/62741_flower/images/` and writes only the `.npy` masks
-(`MASKS_ONLY=1`). Batch 32, bf16, 48 download threads, 2-day walltime. If the
-walltime runs out, resubmit the same command: it resumes by `photo_id`, and
-images already downloaded are reused. It ends by running `collect.py` and
-`run_metrics.py --scan-masks`.
+`TAXON_ID` defaults to 62741 in all four; `TAXON_ID=160559 sbatch ...` for another.
+
+**0. `build_taxon_index.sbatch`** decides what gets segmented. The phenovision
+annotations CSV (`ANNOTATIONS` in `settings.sh`) has neither a taxon_id nor a
+file path, so `build_taxon_index.py` joins three things:
+
+1. `inat_photos.parquet` → every photo_id of the taxon (research grade, exact
+   taxon_id), also saved as `data/62741_photos.parquet`;
+2. the annotations → rows whose `observedImageGuid` is one of those photo_ids,
+   with `trait == "flower present"` and `predictionClass == "Detected"`. Rows are
+   per observation and `observedImageGuid` is the one photo the model saw, so an
+   observation's other photos are not in the CSV and are not segmented;
+3. photo_id → `phenobase_inat_data/images/medium/batch_N/<photo_id>.webp`. The
+   batch number does not follow from the photo_id, so paths come from
+   `data/local_image_paths.parquet` first and the rest by listing the batch
+   folders once.
+
+It writes `data/62741_flower_index.parquet` and lists any flower-detected photo
+with no image on disk in `data/62741_flower_index_missing.csv`. Its log gives the
+count at every step.
+
+**1. `b200_taxon.sbatch`** segments every photo in that index, reading each image
+where it lies on `/blue` (nothing is downloaded or copied), and writes only the
+`.npy` masks (`MASKS_ONLY=1`). Batch 32, bf16, 12-hour walltime. If the walltime
+runs out, resubmit it: it resumes by `photo_id`. It ends by running `collect.py`
+and `run_metrics.py --scan-masks`. These are iNat *medium* images (~500 px long
+side), so a mask is ~0.2 MB rather than the ~2.8 MB of a full-size original.
 
 **`run_metrics.csv`** (`section,metric,value`) is every number the run produced.
 The ones that size this job:
@@ -689,15 +711,14 @@ with the same names a full run would have used. It runs on CPUs and resumes:
 a photo whose overlay exists is skipped. Run `run_metrics.py` again afterwards
 and the `render.*` rows appear.
 
-**3. Export.** A raw mask is uint8 and almost all zeros, so it is enormous on disk
-and compresses by two orders of magnitude or more: the 160559 run averaged 2.8 MB
-per mask. `pack_masks.sbatch` writes one `.tar.zst` per `batch_NNNNN` (≤1,000
+**3. Export.** A raw mask is uint8 and almost all zeros, so it compresses by two
+orders of magnitude or more. `pack_masks.sbatch` writes one `.tar.zst` per `batch_NNNNN` (≤1,000
 photos) and verifies each one. It also writes `MANIFEST.tsv` (files, raw bytes,
 packed bytes), `SHA256SUMS`, and copies of `results.csv` and `run_metrics.csv`.
 The last line of its log is the raw-vs-packed total.
 
-Then move `export/62741_flower/` with **Globus**: few large files instead of
-~300k small ones, checksummed and restartable.
+Then move `export/62741_flower/` with **Globus**: a few archives instead of tens of
+thousands of small files, checksummed and restartable.
 
 1. Install **Globus Connect Personal** on the local machine; it becomes your
    endpoint.

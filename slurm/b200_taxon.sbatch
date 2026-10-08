@@ -1,27 +1,31 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# One B200, batched, a whole taxon from S3, masks only.
+# One B200, batched, every flower-detected photo of a taxon that is already on
+# /blue, masks only.
 #
-#     sbatch slurm/b200_taxon.sbatch                        # taxon 62741, 'flower'
-#     TAXON_ID=160559 sbatch slurm/b200_taxon.sbatch
-#     LIMIT=2000 sbatch slurm/b200_taxon.sbatch             # smoke test first
+#     jid=$(sbatch --parsable slurm/build_taxon_index.sbatch)       # CPU, first
+#     sbatch --dependency=afterok:$jid slurm/b200_taxon.sbatch       # then this
 #
-# Then, as a separate CPU job once this one has finished:
+#     TAXON_ID=160559 sbatch slurm/b200_taxon.sbatch                 # another taxon
 #
-#     sbatch --array=0-19 slurm/render.sbatch               # overlays + cut-outs
+# Then, as separate CPU jobs once this one has finished:
 #
-# What differs from b200.sbatch (the one-hour local benchmark):
+#     sbatch --array=0-9 slurm/render.sbatch        # overlays + cut-outs
+#     sbatch slurm/pack_masks.sbatch                # masks -> .tar.zst for Globus
 #
-#   TAXON_ID    photos come from the parquet index and are downloaded from iNat's
-#               S3 bucket into <out>/images/, where render.sbatch finds them later.
-#   MASKS_ONLY  only the .npy masks are written. Overlays and cut-outs are PNG
-#               encoding — CPU work that would otherwise hold the B200 hostage.
-#   no clock    the whole taxon, not an hour of it. If the walltime runs out,
-#               resubmit the same command: resume is by photo_id and the images
-#               already downloaded are reused.
-#   WORKERS     48 download threads. These are network waits, not CPU, so they
-#               go well past the 14 cores; back off if download_failed shows 429s.
-#   DISCARD     off — the masks are the point.
+# What it reads: data/<taxon>_flower_index.parquet, from build_taxon_index.sbatch
+# — the taxon's photos (inat_photos.parquet) that the phenovision annotations
+# mark 'flower present' + Detected, each with its image path under IMAGE_ROOT.
+# Images are opened where they lie; nothing is downloaded, copied or deleted.
+#
+# What differs from b200.sbatch (the one-hour benchmark over all of /blue):
+#
+#   LOCAL_INDEX  the one taxon's flower index, not the 2.8M-row flowering index.
+#   MASKS_ONLY   only the .npy masks are written. Overlays and cut-outs are PNG
+#                encoding — CPU work that would otherwise hold the B200 hostage.
+#   no clock     every photo in the index, not an hour of them. If the walltime
+#                runs out, resubmit: resume is by photo_id.
+#   DISCARD      off — the masks are the point.
 #
 # The job ends by merging the shard CSV (collect.py) and writing the metrics
 # (run_metrics.py): run_metrics.csv is the flat table of every number, including
@@ -32,7 +36,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=240gb
-#SBATCH --time=2-00:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --requeue
@@ -45,29 +49,41 @@ cd "$SLURM_SUBMIT_DIR"
 # first, so this job's own defaults apply only when nothing was.
 caller_taxon_id="${TAXON_ID:-}"
 caller_out_dir="${OUT_DIR:-}"
+caller_local_index="${LOCAL_INDEX:-}"
 caller_batch_size="${BATCH_SIZE:-}"
 caller_save_workers="${SAVE_WORKERS:-}"
-caller_workers="${WORKERS:-}"
 caller_bf16="${BF16-1}"                      # unset -> 1; BF16= (empty) -> fp32
 source slurm/settings.sh
 
 export SHARD=0
 export NUM_SHARDS=1
 
-export LOCAL_INDEX=                          # a taxon run: parquet + S3, not /blue
 export TAXON_ID="${caller_taxon_id:-62741}"
-export LIMIT="${LIMIT-}"
-export MAX_SECONDS=                          # the whole taxon, not a timed sample
+export LOCAL_INDEX="${caller_local_index:-${PROJECT}/data/${TAXON_ID}_flower_index.parquet}"
+export IMAGE_ROOT="${IMAGE_ROOT}"
+export LIMIT=                                # every photo in the index
+export MAX_SECONDS=                          # the whole index, not a timed sample
 export BATCH_SIZE="${caller_batch_size:-32}"
 export SAVE_WORKERS="${caller_save_workers:-10}"
-export WORKERS="${caller_workers:-48}"
+export WORKERS="${WORKERS:-16}"
 export BF16="$caller_bf16"
 export MASKS_ONLY=1
 export DISCARD=
 export TELEMETRY_S="${TELEMETRY_S:-5}"
 export OUT_DIR="${caller_out_dir:-${RESULTS}/${TAXON_ID}_${PROMPT// /_}}"
 
+if [[ ! -f "$LOCAL_INDEX" ]]; then
+    echo "ERROR: no taxon index at $LOCAL_INDEX" >&2
+    echo "       run: TAXON_ID=$TAXON_ID sbatch slurm/build_taxon_index.sbatch" >&2
+    exit 1
+fi
+
 bash "$SLURM_SUBMIT_DIR/slurm/run_shard.sh"
+
+# run_shard.sh activated the env in its own shell; this one needs it too.
+module purge
+module load conda
+set +u; conda activate "$CONDA_ENV"; set -u
 
 echo
 echo "== taxon ${TAXON_ID}, one B200, masks only =="
