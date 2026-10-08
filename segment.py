@@ -34,6 +34,10 @@ the list, for timed throughput tests:
         --out results/b200_flower --prompt flower --bf16 \\
         --batch-size 32 --save-workers 16 --max-seconds 3600
 
+--masks-only writes the .npy masks and nothing else that is per-instance: no
+overlays, no cut-outs. Those are pure CPU work over the masks and the image, so
+render.py makes them afterwards on a CPU partition instead of on a B200's clock.
+
 Output layout (shared by all shards of a run):
 
     <out>/images/batch_00001/Genus_species_<photo_id>.jpg
@@ -106,6 +110,9 @@ CSV_COLUMNS = [
     "host", "gpu", "done_at", "width", "height",
     "download_s", "download_bytes", "download_mbps", "reused_image",
     "wait_s", "prep_s", "infer_s", "post_s", "save_s", "output_bytes",
+    # The .npy masks alone, summed over this photo's instances. output_bytes also
+    # counts the image and any PNGs; this is what a masks-only export weighs.
+    "mask_bytes",
 ]
 
 
@@ -569,6 +576,7 @@ def main():
     depth = args.workers + args.batch_size * PREFETCH_BATCHES
     print(f"pipeline   : batch {args.batch_size}, {args.workers} readers {depth} deep,"
           f" {args.save_workers} savers"
+          + (", masks only" if args.masks_only else "")
           + (f", stop after {args.max_seconds:.0f}s" if args.max_seconds else ""))
 
     # Read ahead, segment a batch at a time, write behind. The three stages
@@ -633,7 +641,7 @@ def main():
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "workers": args.workers, "batch_size": args.batch_size,
         "prefetch": depth, "save_workers": args.save_workers, "bf16": args.bf16,
-        "discard_outputs": args.discard_outputs,
+        "discard_outputs": args.discard_outputs, "masks_only": args.masks_only,
         "max_seconds": args.max_seconds, "stopped_early": stopped_early,
         "started_at": shard_started, "finished_at": time.time(),
         "parquet_s": round(parquet_s, 2), "model_load_s": round(model_load_s, 2),
@@ -726,28 +734,30 @@ def _save_photo(row, image, image_path, masks, scores, stages, common, out, args
     stem = row["stem"]
     written = []
     mask_paths, segment_paths, rgbs = [], [], []
+    mask_bytes = 0
     for i, mask in enumerate(masks):
         mask_path = out / "masks" / row["batch"] / f"{stem}_instance_{i}.npy"
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(mask_path, mask)
         mask_paths.append(str(mask_path.relative_to(out)))
         written.append(mask_path)
+        mask_bytes += mask_path.stat().st_size
 
-        cutout = out / "segments" / row["batch"] / f"{stem}_segment_{i}.png"
-        if save_cutout(image, mask, cutout):
-            segment_paths.append(str(cutout.relative_to(out)))
-            written.append(cutout)
+        if not args.masks_only:
+            cutout = out / "segments" / row["batch"] / f"{stem}_segment_{i}.png"
+            if save_cutout(image, mask, cutout):
+                segment_paths.append(str(cutout.relative_to(out)))
+                written.append(cutout)
 
         rgbs.append(avg_rgb(image, mask))
 
     overlay_rel = ""
-    status_key = "no_detections"
-    if masks:
+    status_key = "ok" if masks else "no_detections"
+    if masks and not args.masks_only:
         overlay = out / "overlays" / row["batch"] / f"{stem}_overlay.png"
         save_overlay(image, masks, scores, args.prompt, overlay)
         overlay_rel = str(overlay.relative_to(out))
         written.append(overlay)
-        status_key = "ok"
     save_s = time.perf_counter() - saving
 
     # What this photo would cost on disk if kept: the downloaded image plus
@@ -770,7 +780,7 @@ def _save_photo(row, image, image_path, masks, scores, stages, common, out, args
         mask_scores=",".join(f"{s:.4f}" for s in scores),
         mask_avg_rgb=";".join(rgbs),
         seconds=f"{seconds:.3f}",
-        save_s=f"{save_s:.4f}", output_bytes=output_bytes,
+        save_s=f"{save_s:.4f}", output_bytes=output_bytes, mask_bytes=mask_bytes,
         done_at=f"{time.time():.3f}",
         **stages, **common))
 
@@ -949,6 +959,10 @@ def parse_args():
                         help="Use only the first N photos of the taxon (for testing)")
     parser.add_argument("--bf16", action="store_true",
                         help="Run inference in bfloat16 (faster; slightly different masks)")
+    parser.add_argument("--masks-only", action="store_true",
+                        help="Write only the .npy masks (plus the downloaded image and the "
+                             "CSV row). No overlays or cut-outs; render.py makes those "
+                             "later, from the masks, on CPUs.")
     parser.add_argument("--discard-outputs", action="store_true",
                         help="Benchmark mode: write each photo's image, masks, overlay and "
                              "cut-outs (so timing is real), measure them, then delete them. "

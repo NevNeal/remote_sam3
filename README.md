@@ -12,6 +12,7 @@ build_index.py     make the metadata index (once, then monthly)
 segment.py         the pipeline — one GPU, one shard
 collect.py         merge the shard CSVs and report on a finished run
 run_metrics.py     detailed timing, GPU, detection and cost metrics for a run
+render.py          overlays + cut-outs from a --masks-only run's masks, on CPUs
 sweep_batch.py     which batch size saturates this GPU? run before a B200 run
 tests/             pytest: parquet -> shard rows -> S3 download, batching. No GPU
 setup_env.sh       create the conda env from environment.yml, cache the model
@@ -23,7 +24,8 @@ slurm/bench.sh     benchmark a taxon: timed run + report, outputs deleted
 bench_report.py    turns a benchmark's raw timing into report.md
 slurm/*.sbatch     the jobs: test (1 GPU), test_2gpu (2 GPUs), array (N GPUs),
                    local (N GPUs over /blue), b200 + b200_sweep (one B200),
-                   build_index (CPU)
+                   b200_taxon (a whole taxon on one B200, masks only),
+                   render + pack_masks (CPU, after b200_taxon), build_index (CPU)
 ```
 
 On HiPerGator it lives in `flower_sam3/`, and everything it creates stays
@@ -648,6 +650,66 @@ Check what your group can actually have first — `slurmInfo`, and
 `sinfo -p hpg-b200 -o '%P %a %l %D %t %G'` for what is idle. Eight B200s per
 node and ~504 in the cluster is a much smaller pool than the ~600 L4s, and the
 investment QOS is the real ceiling.
+
+## 6e. A whole taxon on one B200, masks only — then render, then export
+
+Three separate jobs, in order. Only the first needs a GPU.
+
+```bash
+LIMIT=2000 OUT_DIR=results/62741_smoke sbatch slurm/b200_taxon.sbatch   # 10-min check
+sbatch slurm/b200_taxon.sbatch                 # 1. taxon 62741: masks only, B200
+sbatch --array=0-19 slurm/render.sbatch        # 2. overlays + cut-outs, 20 CPU tasks
+sbatch slurm/pack_masks.sbatch                 # 3. masks -> export/62741_flower/*.tar.zst
+```
+
+**1. `b200_taxon.sbatch`** downloads every photo of `TAXON_ID` (default 62741)
+from S3 into `results/62741_flower/images/` and writes only the `.npy` masks
+(`MASKS_ONLY=1`). Batch 32, bf16, 48 download threads, 2-day walltime. If the
+walltime runs out, resubmit the same command: it resumes by `photo_id`, and
+images already downloaded are reused. It ends by running `collect.py` and
+`run_metrics.py --scan-masks`.
+
+**`run_metrics.csv`** (`section,metric,value`) is every number the run produced.
+The ones that size this job:
+
+| metric | meaning |
+|---|---|
+| `speed.avg_s_per_image_wall` | loop seconds ÷ photos — what the overlapped pipeline achieved |
+| `speed.avg_s_per_image_processing` | mean of prep+infer+post+save for one photo |
+| `speed.avg_gpu_s_per_image` | that photo's share of its batch's forward pass |
+| `speed.avg_s_per_segment_per_image` | each photo's seconds ÷ its own mask count, averaged |
+| `speed.wall_s_per_segment` | loop seconds ÷ every mask in the run |
+| `masks.total_bytes` / `total_gb` | every `.npy`, summed from the CSV's `mask_bytes` |
+| `masks.avg_mb_per_mask` | mean `.npy` size (each mask is W×H uint8 + 128 B header) |
+| `masks.disk_total_gb` | the same total, from walking `masks/` on disk |
+
+**2. `render.sbatch`** is the overlay and cut-out half of the old pipeline. It
+reads the masks, images and scores back and writes `overlays/` and `segments/`
+with the same names a full run would have used. It runs on CPUs and resumes:
+a photo whose overlay exists is skipped. Run `run_metrics.py` again afterwards
+and the `render.*` rows appear.
+
+**3. Export.** A raw mask is uint8 and almost all zeros, so it is enormous on disk
+and compresses by two orders of magnitude or more: the 160559 run averaged 2.8 MB
+per mask. `pack_masks.sbatch` writes one `.tar.zst` per `batch_NNNNN` (≤1,000
+photos) and verifies each one. It also writes `MANIFEST.tsv` (files, raw bytes,
+packed bytes), `SHA256SUMS`, and copies of `results.csv` and `run_metrics.csv`.
+The last line of its log is the raw-vs-packed total.
+
+Then move `export/62741_flower/` with **Globus**: few large files instead of
+~300k small ones, checksummed and restartable.
+
+1. Install **Globus Connect Personal** on the local machine; it becomes your
+   endpoint.
+2. In the Globus web app, sign in with UF credentials, search the collections
+   for **UFRC** (the HiPerGator endpoint) and browse to
+   `/blue/guralnick/neal.nevyn/flower_sam3/export/62741_flower/`.
+3. Transfer to a local folder with *verify file integrity* on.
+4. Locally: `sha256sum -c SHA256SUMS`, then for each archive
+   `zstd -dc masks_batch_00001.tar.zst | tar -xf -` (zstd is in conda-forge).
+
+`scp`/`rsync` work too for a few GB, but Globus is what UFRC recommends for
+anything large, and it resumes on its own if the laptop sleeps.
 
 ## Tests
 

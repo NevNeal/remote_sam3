@@ -8,6 +8,7 @@
 #     array.sbatch       N shards, the whole taxon
 #     local.sbatch       N shards over images already on /blue (LOCAL_INDEX)
 #     b200.sbatch        1 B200, batched, one hour on the clock
+#     b200_taxon.sbatch  1 B200, batched, a whole taxon, masks only
 #
 # Inputs (environment): SHARD, NUM_SHARDS, and optionally LIMIT, OUT_DIR,
 # MAX_SECONDS and BF16, plus everything in settings.sh.
@@ -97,6 +98,11 @@ fi
 # LIMIT=200 with 2 shards gives each shard 100.
 if [[ -n "${LIMIT:-}" ]]; then
     args+=(--limit "$LIMIT")
+fi
+# MASKS_ONLY=1: write the .npy masks and skip overlays/cut-outs (render.sbatch
+# makes those afterwards, on CPUs).
+if [[ -n "${MASKS_ONLY:-}" ]]; then
+    args+=(--masks-only)
 fi
 # DISCARD=1: benchmark mode — every output is written, measured, then deleted.
 if [[ -n "${DISCARD:-}" ]]; then

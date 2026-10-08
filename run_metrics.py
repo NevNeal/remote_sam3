@@ -13,7 +13,10 @@ Reads from the run directory (everything segment.py and run_shard.sh leave):
 and, when sacct is on the PATH, the SLURM accounting for the job(s) named in
 the timing JSONs (allocated time, peak RSS, CPU time, final state).
 
-Prints a report and writes metrics.json and per_shard.csv next to the results.
+Prints a report and writes, next to the results:
+    run_metrics.csv     every metric below as one flat section,metric,value table
+    metrics.json        the same numbers, nested
+    per_shard.csv       one row per shard
 Works for local runs (images read in place on /blue) and download runs alike.
 
 Definitions:
@@ -21,11 +24,17 @@ Definitions:
     busy       sum of infer_s: the forward pass, bracketed by cuda.synchronize
     wait       sum of wait_s: main loop idle, waiting on the image reader
     allocated  sacct ElapsedRaw: how long SLURM held the GPU
+    segment    one mask instance; "per segment per image" divides each photo's
+               time by its own mask count, then averages over detected photos
+
+--scan-masks also walks <run>/masks and sums the .npy files actually on disk,
+as a check on the per-photo mask_bytes the CSV recorded.
 """
 
 import argparse
 import glob
 import json
+import os
 import shutil
 import subprocess
 from io import StringIO
@@ -37,7 +46,7 @@ import pandas as pd
 STAGES = ["wait_s", "prep_s", "infer_s", "post_s", "save_s"]
 NUMERIC = STAGES + ["seconds", "download_s", "download_bytes", "download_mbps",
                     "reused_image", "output_bytes", "width", "height",
-                    "num_masks", "shard", "done_at"]
+                    "num_masks", "shard", "done_at", "mask_bytes"]
 # data/local_image_paths.parquet: every flowering row of the dated annotations.
 FULL_INDEX = 2_849_542
 
@@ -53,6 +62,8 @@ def main():
                         help="GPU counts to project wall clock for")
     parser.add_argument("--no-sacct", action="store_true",
                         help="Skip querying SLURM accounting")
+    parser.add_argument("--scan-masks", action="store_true",
+                        help="Also sum every .npy under <run>/masks on disk")
     args = parser.parse_args()
 
     run = Path(args.run_dir).expanduser().resolve()
@@ -70,13 +81,18 @@ def main():
         "reads": reads(photos),
         "detections": detections(photos),
         "storage": storage(photos),
+        "masks": mask_sizes(photos, run, args.scan_masks),
+        "render": render_jobs(run),
     }
+    summary["speed"] = speed(photos, summary)
     summary["projection"] = projection(summary, args.project_to, args.gpus)
 
     per_shard.to_csv(run / "per_shard.csv", index=False)
     (run / "metrics.json").write_text(json.dumps(summary, indent=2, default=_json))
+    flat_csv(summary).to_csv(run / "run_metrics.csv", index=False)
     print(render(summary, per_shard, photos))
-    print(f"\nwrote {run / 'metrics.json'} and {run / 'per_shard.csv'}")
+    print(f"\nwrote {run / 'run_metrics.csv'}, {run / 'metrics.json'} "
+          f"and {run / 'per_shard.csv'}")
 
 
 # -- loading -------------------------------------------------------------------
@@ -401,6 +417,133 @@ def storage(photos):
     }
 
 
+def speed(photos, summary):
+    """The headline timing numbers, per image and per segment.
+
+    Two kinds of "per image": wall is loop time / photos, i.e. what the run
+    actually achieved with reads, GPU and writes overlapping; processing is the
+    mean of `seconds` (prep+infer+post+save), the work one photo costs. A batched
+    photo's prep/infer are its share of the batch, so these sum correctly.
+    """
+    ok = photos[photos["status"] == "ok"]
+    hit = ok[ok["num_masks"] > 0]
+    n_masks = hit["num_masks"]
+    loop = summary["throughput"]["gpu_hours_loop"] * 3600
+    n = len(photos)
+    masks_total = int(n_masks.sum())
+    per_seg = hit["seconds"] / n_masks
+    return {
+        "photos": n,
+        "photos_ok": len(ok),
+        "photos_with_mask": len(hit),
+        "segments_total": masks_total,
+        "loop_s": loop,
+        "images_per_s": n / loop if _positive(loop) else np.nan,
+        "images_per_hour": 3600 * n / loop if _positive(loop) else np.nan,
+        "segments_per_s": masks_total / loop if _positive(loop) else np.nan,
+        "avg_s_per_image_wall": loop / n if _positive(loop) and n else np.nan,
+        "avg_s_per_image_processing": ok["seconds"].mean(),
+        "median_s_per_image_processing": ok["seconds"].median(),
+        "avg_gpu_s_per_image": ok["infer_s"].mean(),
+        "avg_download_s_per_image": photos["download_s"].mean(),
+        "avg_wait_s_per_image": photos["wait_s"].mean(),
+        "avg_save_s_per_image": ok["save_s"].mean(),
+        "avg_s_per_segment_per_image": per_seg.mean(),
+        "median_s_per_segment_per_image": per_seg.median(),
+        "avg_gpu_s_per_segment_per_image": (hit["infer_s"] / n_masks).mean(),
+        "avg_save_s_per_segment_per_image": (hit["save_s"] / n_masks).mean(),
+        "wall_s_per_segment": loop / masks_total if _positive(loop) and masks_total else np.nan,
+    }
+
+
+def mask_sizes(photos, run, scan):
+    """Size of the .npy masks: from the CSV's per-photo mask_bytes, else by
+    stat-ing the paths in mask_paths, and optionally a walk of masks/ on disk.
+
+    Every mask of a photo is the photo's own W x H in uint8, so a photo's
+    mask_bytes / num_masks is exactly each of its masks' size, and the
+    per-mask distribution is that value repeated num_masks times."""
+    hit = photos[(photos["status"] == "ok") & (photos["num_masks"] > 0)].copy()
+    source = "csv mask_bytes"
+    if len(hit) and hit["mask_bytes"].isna().all():
+        source = "stat of mask_paths"
+        hit["mask_bytes"] = [
+            sum((run / m).stat().st_size for m in str(paths).split(";") if (run / m).exists())
+            for paths in hit["mask_paths"]]
+    total = hit["mask_bytes"].sum()
+    count = int(hit["num_masks"].sum())
+    each = np.repeat((hit["mask_bytes"] / hit["num_masks"]).to_numpy(dtype=float),
+                     hit["num_masks"].astype(int).to_numpy())
+    ok = photos[photos["status"] == "ok"]
+    out = {
+        "source": source,
+        "mask_files": count,
+        "total_bytes": int(total),
+        "total_mb": total / 1e6,
+        "total_gb": total / 1e9,
+        "total_gib": total / 2**30,
+        "avg_mb_per_mask": each.mean() / 1e6 if len(each) else np.nan,
+        "median_mb_per_mask": np.median(each) / 1e6 if len(each) else np.nan,
+        "p95_mb_per_mask": np.quantile(each, 0.95) / 1e6 if len(each) else np.nan,
+        "max_mb_per_mask": each.max() / 1e6 if len(each) else np.nan,
+        "avg_mb_per_detected_photo": hit["mask_bytes"].mean() / 1e6,
+        "avg_mb_per_photo_ok": total / 1e6 / max(len(ok), 1),
+    }
+    if scan:
+        files = size = 0
+        for root, _, names in os.walk(run / "masks"):
+            for name in names:
+                if name.endswith(".npy"):
+                    files += 1
+                    size += os.path.getsize(os.path.join(root, name))
+        out.update(disk_mask_files=files, disk_total_bytes=size, disk_total_gb=size / 1e9,
+                   disk_total_gib=size / 2**30)
+    return out
+
+
+def render_jobs(run):
+    """render.py's per-photo logs, if the CPU render has run."""
+    files = sorted(glob.glob(str(run / "render_shard_*.csv")))
+    if not files:
+        return {}
+    r = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
+    r = r.drop_duplicates(subset=["photo_id"], keep="last")
+    r["render_s"] = pd.to_numeric(r["render_s"], errors="coerce")
+    good = r[r["status"] == "ok"]
+    return {
+        "photos_rendered": len(good), "failed": int((r["status"] != "ok").sum()),
+        "avg_render_s_per_image": good["render_s"].mean(),
+        "render_cpu_hours": good["render_s"].sum() / 3600,
+        "total_gb": pd.to_numeric(good["render_bytes"], errors="coerce").sum() / 1e9,
+    }
+
+
+def flat_csv(summary):
+    """Every scalar in the summary as section,metric,value. Lists and the
+    masks-per-photo histogram are JSON in the value cell."""
+    order = ["speed", "masks"] + [k for k in summary if k not in ("speed", "masks")]
+    rows = []
+
+    def walk(section, prefix, value):
+        if isinstance(value, dict) and not prefix.endswith("histogram"):
+            for k, v in value.items():
+                walk(section, f"{prefix}.{k}" if prefix else str(k), v)
+        elif isinstance(value, (list, dict)):
+            rows.append((section, prefix, json.dumps(value, default=_json)))
+        elif isinstance(value, (np.integer, np.floating)):
+            rows.append((section, prefix, _json(value)))
+        else:
+            rows.append((section, prefix, value))
+
+    for section in order:
+        value = summary[section]
+        if isinstance(value, dict):
+            walk(section, "", value)
+        else:
+            rows.append(("run", section, value))
+    return pd.DataFrame(rows, columns=["section", "metric", "value"])
+
+
 def projection(summary, target, gpu_counts):
     t = summary["throughput"]
     rate = t["per_gpu_photos_per_s_loop"]
@@ -472,6 +615,26 @@ def render(s, per_shard, photos):
                  + f"{share:>8}")
     L.append("  *total = prep+infer+post+save; wait (GPU idle on image reads) is not in it")
     L += _bottleneck(st, tp)
+
+    sp, mk = s["speed"], s["masks"]
+    L += ["", "-- speed " + "-" * 62,
+          f"  per image           {f(sp['avg_s_per_image_wall'], '.3f')} s wall,  "
+          f"{f(sp['avg_s_per_image_processing'], '.3f')} s processing,  "
+          f"{f(sp['avg_gpu_s_per_image'], '.3f')} s GPU",
+          f"  per segment/image   {f(sp['avg_s_per_segment_per_image'], '.3f')} s mean, "
+          f"{f(sp['median_s_per_segment_per_image'], '.3f')} s median  "
+          f"({f(sp['wall_s_per_segment'], '.3f')} s wall per segment)",
+          f"  rate                {f(sp['images_per_s'], '.2f')} images/s,  "
+          f"{f(sp['segments_per_s'], '.2f')} segments/s",
+          "", "-- .npy masks " + "-" * 57,
+          f"  total               {mk['mask_files']:,} files, {f(mk['total_gb'], '.2f')} GB "
+          f"({f(mk['total_gib'], '.2f')} GiB)   [{mk['source']}]",
+          f"  per mask            mean {f(mk['avg_mb_per_mask'], '.2f')} MB, median "
+          f"{f(mk['median_mb_per_mask'], '.2f')} MB, p95 {f(mk['p95_mb_per_mask'], '.2f')} MB",
+          f"  per detected photo  {f(mk['avg_mb_per_detected_photo'], '.2f')} MB"]
+    if "disk_total_gb" in mk:
+        L.append(f"  on disk (scan)      {mk['disk_mask_files']:,} files, "
+                 f"{f(mk['disk_total_gb'], '.2f')} GB")
 
     L += ["", "-- image reads " + "-" * 56,
           f"  file size           median {f(rd['file_mb_median'], '.2f')} MB, p95 "
