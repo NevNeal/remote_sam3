@@ -104,6 +104,11 @@ fi
 if [[ -n "${MASKS_ONLY:-}" ]]; then
     args+=(--masks-only)
 fi
+# MASK_FORMAT=npz: one bit-packed, compressed file per photo instead of one
+# full-frame .npy per mask (maskio.py).
+if [[ -n "${MASK_FORMAT:-}" ]]; then
+    args+=(--mask-format "$MASK_FORMAT")
+fi
 # DISCARD=1: benchmark mode — every output is written, measured, then deleted.
 if [[ -n "${DISCARD:-}" ]]; then
     args+=(--discard-outputs)

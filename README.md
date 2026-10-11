@@ -732,6 +732,50 @@ thousands of small files, checksummed and restartable.
 `scp`/`rsync` work too for a few GB, but Globus is what UFRC recommends for
 anything large, and it resumes on its own if the laptop sleeps.
 
+## 6f. All angiosperm genera: 100 photos each, one B200
+
+```bash
+bash slurm/all_genera.sh
+```
+
+One command, three chained jobs:
+
+| job | where | what |
+|---|---|---|
+| `build_genus_index.sbatch` | CPU | up to 100 flower-detected photos per angiosperm genus, with image paths |
+| `all_genera.sbatch` | 1 B200, 4-day walltime, requeues | segments them: masks only, packed `.npz` |
+| `all_genera_report.sbatch` | CPU | metadata CSV, 3 review figures per genus, scatter plot |
+
+**The index** (`build_genus_index.py`) reads the phenovision annotations CSV for
+rows with `trait == "flower present"` and `predictionClass == "Detected"`. The
+CSV carries `genus` and `family` but nothing above them, so which genera are
+angiosperms comes from iNaturalist's `taxa.csv.gz` (anything under Angiospermae,
+taxon 47125). It carries no file paths either, so every `batch_N` folder is listed
+once and cached in `data/image_paths_all.parquet`. The 100 are a seeded random
+sample of the photos that really have a file; a genus with fewer keeps what it
+has, and `data/all_genera_index_genera.csv` has the count for every genus.
+
+**The masks** are one `<stem>_masks.npz` per photo: every mask of the photo,
+one bit per pixel, compressed, with the scores (`maskio.py`,
+`docs/mask_format.pdf`). About 2 KB per photo instead of ~0.56 MB.
+
+**The report** fills `export/all_genera/`, which is the folder to download:
+
+```
+all_genera_segment_metadata.csv              one row per photo
+all_genera_genus_summary.csv                 one row per genus
+segment_conf_vs_prediction_probability.png   plot_conf_vs_probability.py
+run_metrics.csv, all_genera_index_genera.csv
+figures/<Family>/<Genus>_<low|median|high>_<photo_id>.jpg
+```
+
+A photo's confidence is `conf_top5_mean`: the mean of its five highest SAM3 mask
+scores (all of them if it has fewer). Each genus's lowest, median and highest
+photo by that number get a review figure. The annotation's
+`prediction_probability` is a column in the metadata and the x-axis of the plot,
+and is never used to choose photos. `MIN_SCORE` is 0.9, so every kept score, and
+therefore every `conf_top5_mean`, is at least 0.9.
+
 ## Tests
 
 `tests/` covers the download path — reading a shard's rows out of the parquet

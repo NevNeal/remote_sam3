@@ -11,8 +11,10 @@ from argparse import Namespace
 
 import numpy as np
 import pandas as pd
+import pytest
 from PIL import Image
 
+import maskio
 import segment
 
 
@@ -26,7 +28,7 @@ class RecordingSaver:
         self.results.write(**fields)
 
 
-def _segment_photo(out, results, photo_id, masks, size=(40, 30)):
+def _segment_photo(out, results, photo_id, masks, size=(40, 30), mask_format="npy"):
     row = {"photo_id": photo_id, "stem": f"Rudbeckia_hirta_{photo_id}",
            "batch": "batch_00001"}
     image_path = out / "images" / "batch_00001" / f"{row['stem']}.jpg"
@@ -40,7 +42,8 @@ def _segment_photo(out, results, photo_id, masks, size=(40, 30)):
               "download_bytes": image_path.stat().st_size, "reused_image": 0,
               "wait_s": 0.01}
     stages = {"prep_s": "0.0100", "infer_s": "0.2000", "post_s": "0.0300"}
-    args = Namespace(masks_only=True, discard_outputs=False, prompt="flower")
+    args = Namespace(masks_only=True, discard_outputs=False, prompt="flower",
+                     mask_format=mask_format)
     segment._save_photo(row, image, image_path, masks, [0.95, 0.91][:len(masks)],
                         stages, common, out, args, RecordingSaver(results))
 
@@ -54,15 +57,23 @@ def _masks(count, size=(40, 30)):
     return out
 
 
-def test_masks_only_then_render_then_metrics(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mask_format", ["npy", "npz"])
+def test_masks_only_then_render_then_metrics(tmp_path, monkeypatch, mask_format):
     out = tmp_path / "62741_flower"
     results = segment.Results(out / "results_shard_000.csv", out / "errors_shard_000.txt")
-    _segment_photo(out, results, 1, _masks(2))
-    _segment_photo(out, results, 2, [])                    # no detections
+    _segment_photo(out, results, 1, _masks(2), mask_format=mask_format)
+    _segment_photo(out, results, 2, [], mask_format=mask_format)   # no detections
 
     # Only masks: no overlays, no cut-outs, and mask_bytes is the .npy total.
-    npys = sorted((out / "masks").rglob("*.npy"))
-    assert len(npys) == 2
+    npys = sorted((out / "masks").rglob("*.np[yz]"))
+    assert len(npys) == (2 if mask_format == "npy" else 1)
+    if mask_format == "npz":
+        # Lossless: exactly the arrays that went in, plus their scores.
+        loaded, scores = maskio.load_masks(npys[0])
+        assert loaded.shape == (2, 30, 40) and loaded.dtype == bool
+        assert all((a == b).all() for a, b in zip(loaded, _masks(2)))
+        assert list(scores.round(2)) == [0.95, 0.91]
+        assert npys[0].stat().st_size < 2 * 30 * 40
     assert not (out / "overlays").exists() and not (out / "segments").exists()
     csv = pd.read_csv(out / "results_shard_000.csv")
     assert csv.loc[csv.photo_id == 1, "mask_bytes"].item() == sum(p.stat().st_size for p in npys)
@@ -94,6 +105,13 @@ def test_masks_only_then_render_then_metrics(tmp_path, monkeypatch):
     assert int(get("masks", "total_bytes")) == total
     assert int(get("masks", "disk_total_bytes")) == total
     assert float(get("masks", "avg_mb_per_mask")) == total / 2 / 1e6
+    assert int(get("masks", "masks")) == 2
+    assert int(get("masks", "mask_files")) == len(npys)
+
+    import review_figure
+    monkeypatch.setattr(sys, "argv", ["review_figure.py", str(out), "--workers", "1"])
+    review_figure.main()
+    assert (out / "review" / "batch_00001" / "Rudbeckia_hirta_1_review.png").exists()
     assert int(get("speed", "segments_total")) == 2
     assert float(get("speed", "avg_s_per_image_wall")) == 1.0      # 2 s loop / 2 photos
     per_seg = float(get("speed", "avg_s_per_segment_per_image"))

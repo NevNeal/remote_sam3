@@ -30,6 +30,8 @@ import numpy as np
 import pandas as pd
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
+from maskio import load_photo_masks, stem_and_batch
+
 TOP_K = 5
 PANEL_H = 1000                # height of the figure body, px
 HEADER_H = 44
@@ -107,9 +109,8 @@ def load_detected(run):
 
 
 def _figure_rel(row):
-    first = Path(str(row["mask_paths"]).split(";")[0])
-    stem = first.name.rsplit("_instance_", 1)[0]
-    return Path("review") / first.parent.name / f"{stem}_review.png"
+    stem, batch = stem_and_batch(row["mask_paths"])
+    return Path("review") / batch / f"{stem}_review.png"
 
 
 def _draw_star(job):
@@ -121,15 +122,15 @@ def draw_one(run, row):
         image_path = Path(str(row["image_path"]))
         image = Image.open(image_path if image_path.is_absolute() else run / image_path)
         image = image.convert("RGB")
-        mask_rels = str(row["mask_paths"]).split(";")
+        all_masks = load_photo_masks(run, row["mask_paths"])
         scores = [float(s) for s in str(row["mask_scores"]).split(",")]
         # segment.py writes masks most confident first; sort anyway, so the
         # figure is right even for a CSV that was not.
-        order = sorted(range(len(mask_rels)), key=lambda i: scores[i], reverse=True)[:TOP_K]
-        masks = [np.load(run / mask_rels[i]) > 0 for i in order]
+        order = sorted(range(len(all_masks)), key=lambda i: scores[i], reverse=True)[:TOP_K]
+        masks = [all_masks[i] for i in order]
         title = (f"{row.get('taxon_name', '')}   photo {int(row['photo_id'])}   "
                  f"{image.width}x{image.height}")
-        figure = make_figure(image, masks, [scores[i] for i in order], title, len(mask_rels))
+        figure = make_figure(image, masks, [scores[i] for i in order], title, len(all_masks))
         out = run / _figure_rel(row)
         out.parent.mkdir(parents=True, exist_ok=True)
         figure.save(out)

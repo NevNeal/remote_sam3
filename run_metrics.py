@@ -477,7 +477,10 @@ def mask_sizes(photos, run, scan):
     ok = photos[photos["status"] == "ok"]
     out = {
         "source": source,
-        "mask_files": count,
+        "format": "npz (one packed file per photo)" if hit["mask_paths"].astype(str)
+                  .str.endswith(".npz").any() else "npy (one file per mask)",
+        "masks": count,
+        "mask_files": int(hit["mask_paths"].astype(str).str.count(";").add(1).sum()),
         "total_bytes": int(total),
         "total_mb": total / 1e6,
         "total_gb": total / 1e9,
@@ -493,7 +496,7 @@ def mask_sizes(photos, run, scan):
         files = size = 0
         for root, _, names in os.walk(run / "masks"):
             for name in names:
-                if name.endswith(".npy"):
+                if name.endswith((".npy", ".npz")):
                     files += 1
                     size += os.path.getsize(os.path.join(root, name))
         out.update(disk_mask_files=files, disk_total_bytes=size, disk_total_gb=size / 1e9,

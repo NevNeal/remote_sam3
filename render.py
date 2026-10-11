@@ -32,6 +32,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
+from maskio import load_photo_masks, stem_and_batch
 from segment import save_cutout, save_overlay
 
 RENDER_COLUMNS = ["photo_id", "status", "overlay_path", "segment_paths",
@@ -103,9 +104,8 @@ def load_detected(run):
 
 def _overlay_rel(row):
     """overlays/<batch>/<stem>_overlay.png, from the first mask's path."""
-    first = Path(str(row["mask_paths"]).split(";")[0])
-    stem = first.name.rsplit("_instance_", 1)[0]
-    return Path("overlays") / first.parent.name / f"{stem}_overlay.png"
+    stem, batch = stem_and_batch(row["mask_paths"])
+    return Path("overlays") / batch / f"{stem}_overlay.png"
 
 
 def _render_star(job):
@@ -120,14 +120,13 @@ def render_one(run, row, prompt):
         image_path = Path(str(row["image_path"]))
         image = Image.open(image_path if image_path.is_absolute() else run / image_path)
         image = image.convert("RGB")
-        mask_rels = str(row["mask_paths"]).split(";")
         scores = [float(s) for s in str(row["mask_scores"]).split(",")]
-        masks = [np.load(run / m) for m in mask_rels]
+        masks = [m.astype(np.uint8) for m in load_photo_masks(run, row["mask_paths"])]
+        stem, batch = stem_and_batch(row["mask_paths"])
 
         written, segments = [], []
-        for i, (rel, mask) in enumerate(zip(mask_rels, masks)):
-            stem = Path(rel).name.rsplit("_instance_", 1)[0]
-            cutout = run / "segments" / Path(rel).parent.name / f"{stem}_segment_{i}.png"
+        for i, mask in enumerate(masks):
+            cutout = run / "segments" / batch / f"{stem}_segment_{i}.png"
             if save_cutout(image, mask, cutout):
                 segments.append(str(cutout.relative_to(run)))
                 written.append(cutout)

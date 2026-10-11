@@ -72,6 +72,8 @@ from tqdm.auto import tqdm
 from transformers import Sam3Model, Sam3Processor
 from urllib3.util.retry import Retry
 
+from maskio import NPZ_SUFFIX, save_masks
+
 PHOTO_URL = "https://inaturalist-open-data.s3.amazonaws.com/photos/{photo_id}/original.{ext}"
 
 # Images per batch_NNNNN subfolder. Keeps directory listings survivable - a big
@@ -642,6 +644,7 @@ def main():
         "workers": args.workers, "batch_size": args.batch_size,
         "prefetch": depth, "save_workers": args.save_workers, "bf16": args.bf16,
         "discard_outputs": args.discard_outputs, "masks_only": args.masks_only,
+        "mask_format": args.mask_format,
         "max_seconds": args.max_seconds, "stopped_early": stopped_early,
         "started_at": shard_started, "finished_at": time.time(),
         "parquet_s": round(parquet_s, 2), "model_load_s": round(model_load_s, 2),
@@ -735,13 +738,22 @@ def _save_photo(row, image, image_path, masks, scores, stages, common, out, args
     written = []
     mask_paths, segment_paths, rgbs = [], [], []
     mask_bytes = 0
-    for i, mask in enumerate(masks):
-        mask_path = out / "masks" / row["batch"] / f"{stem}_instance_{i}.npy"
+    packed = args.mask_format == "npz"
+    if packed and masks:
+        # Every mask of the photo in one bit-packed, compressed file (maskio.py).
+        mask_path = out / "masks" / row["batch"] / f"{stem}{NPZ_SUFFIX}"
         mask_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(mask_path, mask)
+        mask_bytes = save_masks(mask_path, masks, scores)
         mask_paths.append(str(mask_path.relative_to(out)))
         written.append(mask_path)
-        mask_bytes += mask_path.stat().st_size
+    for i, mask in enumerate(masks):
+        if not packed:
+            mask_path = out / "masks" / row["batch"] / f"{stem}_instance_{i}.npy"
+            mask_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(mask_path, mask)
+            mask_paths.append(str(mask_path.relative_to(out)))
+            written.append(mask_path)
+            mask_bytes += mask_path.stat().st_size
 
         if not args.masks_only:
             cutout = out / "segments" / row["batch"] / f"{stem}_segment_{i}.png"
@@ -959,6 +971,10 @@ def parse_args():
                         help="Use only the first N photos of the taxon (for testing)")
     parser.add_argument("--bf16", action="store_true",
                         help="Run inference in bfloat16 (faster; slightly different masks)")
+    parser.add_argument("--mask-format", choices=("npy", "npz"), default="npy",
+                        help="npy: one full-frame uint8 .npy per mask. npz: one "
+                             "bit-packed, compressed .npz per photo holding all its "
+                             "masks and scores - ~100x smaller. See maskio.py.")
     parser.add_argument("--masks-only", action="store_true",
                         help="Write only the .npy masks (plus the downloaded image and the "
                              "CSV row). No overlays or cut-outs; render.py makes those "

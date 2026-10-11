@@ -22,3 +22,7 @@ tqdm==4.67.1
 # build was actually validated against on the workstation.
 duckdb==1.5.3
 awscli==1.45.15
+
+# plot_conf_vs_probability.py only. all_genera_report.sbatch installs it into an
+# env built before this line was here.
+matplotlib==3.10.9
