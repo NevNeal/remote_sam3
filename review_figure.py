@@ -185,7 +185,8 @@ def _overlay(image, masks, scores, size):
     draw = ImageDraw.Draw(base)
     font = _font(20)
     for i, (x1, y1, _, _), color in sorted(labels):
-        text = f"{i + 1}  {scores[i]:.3f}"
+        # A score of NaN means the run did not record one: number only.
+        text = f"{i + 1}  {scores[i]:.3f}" if scores[i] == scores[i] else f"{i + 1}"
         w = draw.textlength(text, font=font) + 14
         x = min(max(0, x1), size[0] - w)
         y = y1 - 30 if y1 >= 30 else y1 + 4
@@ -223,7 +224,8 @@ def _tile(image, mask, score, i, size):
     ImageDraw.Draw(ghost).text((10, 2), str(i + 1), fill=color + (110,), font=_font(56))
     tile.alpha_composite(ghost)
 
-    draw.text((size[0] - 10, size[1] - 14), f"conf {score:.3f}", fill=TEXT,
+    conf = f"conf {score:.3f}" if score == score else "conf n/a"
+    draw.text((size[0] - 10, size[1] - 14), conf, fill=TEXT,
               font=_font(18), anchor="rm")
     area = 100 * mask.mean()
     draw.text((10, size[1] - 14), f"{area:.1f}% of image", fill=(215, 215, 220),
