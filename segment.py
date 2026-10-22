@@ -540,7 +540,8 @@ def main():
 
     done = results.already_done()
     todo = photos[~photos["photo_id"].isin(done)]
-    print(f"prompt     : '{args.prompt}'  (keep detections >= {args.min_score})")
+    print(f"prompt     : '{args.prompt}'  (keep detections >= {args.min_score}"
+          + (f", top {args.max_masks} per photo)" if args.max_masks else ")"))
     print(f"output     : {out}")
     print(f"resume     : {len(done):,} already done, {len(todo):,} to go")
     if todo.empty:
@@ -644,7 +645,8 @@ def main():
         "workers": args.workers, "batch_size": args.batch_size,
         "prefetch": depth, "save_workers": args.save_workers, "bf16": args.bf16,
         "discard_outputs": args.discard_outputs, "masks_only": args.masks_only,
-        "mask_format": args.mask_format,
+        "mask_format": args.mask_format, "min_score": args.min_score,
+        "max_masks": args.max_masks,
         "max_seconds": args.max_seconds, "stopped_early": stopped_early,
         "started_at": shard_started, "finished_at": time.time(),
         "parquet_s": round(parquet_s, 2), "model_load_s": round(model_load_s, 2),
@@ -722,6 +724,10 @@ def _handle(row, image, error, info, out, model, processor, device,
         return
 
     masks, scores, stages = outcome
+    keep = getattr(args, "max_masks", 0)
+    if keep:
+        # _keep_masks returns them most confident first, so this keeps the top N.
+        masks, scores = masks[:keep], scores[:keep]
     saver.submit(_save_photo, row, image, image_path, masks, scores, stages,
                  common, out, args, saver)
 
@@ -951,6 +957,9 @@ def parse_args():
     parser.add_argument("--prompt", default="flower", help="SAM3 text prompt")
     parser.add_argument("--min-score", type=float, default=0.9,
                         help="Discard detections below this confidence")
+    parser.add_argument("--max-masks", type=int, default=0,
+                        help="Keep only the N most confident detections at or above "
+                             "--min-score per photo. 0 keeps them all.")
     parser.add_argument("--shard", type=int, default=0, help="This worker's shard index")
     parser.add_argument("--num-shards", type=int, default=1, help="Total shards in the run")
     parser.add_argument("--workers", type=int, default=16,

@@ -109,6 +109,10 @@ fi
 if [[ -n "${MASK_FORMAT:-}" ]]; then
     args+=(--mask-format "$MASK_FORMAT")
 fi
+# MAX_MASKS=N: keep only each photo's N most confident detections.
+if [[ -n "${MAX_MASKS:-}" ]]; then
+    args+=(--max-masks "$MAX_MASKS")
+fi
 # DISCARD=1: benchmark mode — every output is written, measured, then deleted.
 if [[ -n "${DISCARD:-}" ]]; then
     args+=(--discard-outputs)
