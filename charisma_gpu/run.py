@@ -13,6 +13,11 @@ one row per segment with two answers per CLUT colour:
                       with each merged colour named by the CLUT (as R's
                       charisma(threshold = 0, pavo = FALSE), checked against it)
     ch_k              charisma's k (number of colour classes)
+    petal_bullseye    bullseye-coloured pixels on the petals, not the disk, as a
+                      share of the segment (petal.py; for a CLUT with bullseye,
+                      disk and ray colours). The number to use for the bullseye
+    disk_red          bullseye-coloured pixels found to be on the disk
+    disk_area         share of the segment taken by the disk found
 
 plus photo_id, mask_index, mask_score and n_pixels. Rows are appended as photos
 finish, so a run that is cut off resumes where it stopped.
@@ -40,6 +45,16 @@ sys.path.insert(0, str(HERE.parent))
 
 from charisma import DEFAULT_CLUT, Clut, charisma_batch, classify_pixels  # noqa: E402
 from maskio import load_photo_masks  # noqa: E402
+from petal import petal_bullseye  # noqa: E402
+
+PETAL_COLS = ("petal_bullseye", "disk_red", "disk_area")
+
+
+def petal_shares(rgb, fg, clut):
+    """The petal-vs-disk split on one segment's 2-D crop, or None if not asked."""
+    if clut is None or not fg.any():
+        return None
+    return {k: round(float(v), 5) for k, v in petal_bullseye(rgb, fg, clut)["shares"].items()}
 
 
 def resolve(run_dir, path):
@@ -47,10 +62,10 @@ def resolve(run_dir, path):
     return path if path.is_absolute() else Path(run_dir) / path
 
 
-def photo_segments(row, run_dir, min_score):
-    """One results row -> [(mask_index, score, [P, 3] uint8 pixels)]. The photo
-    is opened exactly as segment.py opened it (no EXIF rotation), so the masks
-    line up."""
+def photo_segments(row, run_dir, min_score, petal_clut=None):
+    """One results row -> [(mask_index, score, [P, 3] uint8 pixels, petal shares)].
+    The photo is opened exactly as segment.py opened it (no EXIF rotation), so
+    the masks line up."""
     image = np.asarray(Image.open(resolve(run_dir, row["image_path"])).convert("RGB"))
     masks = load_photo_masks(run_dir, str(row["mask_paths"]).replace("\\", "/"))
     scores = [float(s) for s in str(row.get("mask_scores", "")).split(",") if s.strip()]
@@ -62,7 +77,12 @@ def photo_segments(row, run_dir, min_score):
         if mask.shape != image.shape[:2]:
             mask = np.asarray(Image.fromarray(mask).resize(
                 (image.shape[1], image.shape[0]), Image.NEAREST))
-        out.append((i, score, image[mask]))
+        shares = None
+        if petal_clut is not None and mask.any():
+            ys, xs = np.nonzero(mask)
+            box = (slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1))
+            shares = petal_shares(image[box], mask[box], petal_clut)
+        out.append((i, score, image[mask], shares))
     return out
 
 
@@ -83,20 +103,22 @@ def png_rows(png_dir):
                          for pid, segs in by_photo.items()])
 
 
-def png_segments(row):
+def png_segments(row, petal_clut=None):
     """Foreground pixels of each cut-out: R charisma's round(alpha) >= 1."""
     out = []
     for idx, path in row["segment_files"]:
         a = np.asarray(Image.open(path).convert("RGBA"))
-        out.append((idx, float("nan"), a[a[..., 3] >= 128][:, :3]))
+        fg = a[..., 3] >= 128
+        out.append((idx, float("nan"), a[fg][:, :3], petal_shares(a[..., :3], fg, petal_clut)))
     return out
 
 
 class Photos(torch.utils.data.Dataset):
     """Photo decoding and mask reading in DataLoader workers."""
 
-    def __init__(self, rows, run_dir, min_score):
+    def __init__(self, rows, run_dir, min_score, petal_clut=None):
         self.rows, self.run_dir, self.min_score = rows, run_dir, min_score
+        self.petal_clut = petal_clut
 
     def __len__(self):
         return len(self.rows)
@@ -105,8 +127,8 @@ class Photos(torch.utils.data.Dataset):
         row = self.rows[i]
         try:
             if "segment_files" in row:
-                return row, png_segments(row), ""
-            return row, photo_segments(row, self.run_dir, self.min_score), ""
+                return row, png_segments(row, self.petal_clut), ""
+            return row, photo_segments(row, self.run_dir, self.min_score, self.petal_clut), ""
         except Exception as exc:              # a bad file is recorded, not fatal
             return row, [], f"{type(exc).__name__}: {exc}"
 
@@ -148,10 +170,17 @@ def main():
     p.add_argument("--photos-per-batch", type=int, default=64)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--limit", type=int, default=0, help="only this many photos (testing)")
+    p.add_argument("--petal", choices=("auto", "on", "off"), default="auto",
+                   help="petal-vs-disk bullseye split (petal.py); auto = on when the CLUT "
+                        "has bullseye, disk and ray colours")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
 
     clut = Clut.from_csv(args.clut)
+    can_petal = {"bullseye", "disk", "ray"} <= set(clut.names)
+    if args.petal == "on" and not can_petal:
+        raise SystemExit("--petal on needs a CLUT with bullseye, disk and ray colours")
+    petal = args.petal == "on" or (args.petal == "auto" and can_petal)
     results = png_rows(args.png_dir) if args.png_dir else load_results(args.run_dir)
     out = Path(args.out)
     done = set()
@@ -166,7 +195,7 @@ def main():
         return
 
     loader = torch.utils.data.DataLoader(
-        Photos(todo.to_dict("records"), args.run_dir, args.min_score),
+        Photos(todo.to_dict("records"), args.run_dir, args.min_score, clut if petal else None),
         batch_size=args.photos_per_batch, num_workers=args.workers,
         collate_fn=_items, prefetch_factor=4 if args.workers else None)
     cols = ["photo_id", "mask_index", "mask_score", "n_pixels", "error"]
@@ -174,6 +203,8 @@ def main():
         cols += [f"px_{n}" for n in clut.names] + [f"px_{n}_rgb" for n in clut.names]
     if args.mode in ("both", "charisma"):
         cols += ["ch_k"] + [f"ch_{n}" for n in clut.names]
+    if petal:
+        cols += list(PETAL_COLS)
     header = not out.exists()
     out.parent.mkdir(parents=True, exist_ok=True)
     start, n_photos, n_segs = time.time(), 0, 0
@@ -183,9 +214,10 @@ def main():
             if err or not items:
                 recs.append({"photo_id": row["photo_id"], "mask_index": -1,
                              "error": err or "no masks at this score"})
-            for idx, score, px in items:
+            for idx, score, px, shares in items:
                 recs.append({"photo_id": row["photo_id"], "mask_index": idx,
-                             "mask_score": score, "n_pixels": len(px), "error": ""})
+                             "mask_score": score, "n_pixels": len(px), "error": "",
+                             **(shares or {})})
                 segs.append(px)
         seg_recs = [r for r in recs if r["mask_index"] >= 0]
         nonempty = [i for i, s in enumerate(segs) if len(s)]
