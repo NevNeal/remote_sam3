@@ -1,19 +1,19 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# pv99 run: 1M flower-detected angiosperm photos phenovision scored >= 0.99,
-# at least 50 per genus where it has them, SAM3 at min score 0.5, top 5 masks, .npz masks + metadata only. Run from the
+# pv99 run: 50 random flower-detected photos per angiosperm genus, only from
+# photos phenovision scored >= 0.99 (all of them if a genus has fewer). SAM3 at min score 0.5, top 5 masks, .npz masks + metadata only. Run from the
 # project root (the flower_sam3 checkout):
 #
 #     bash all_genera/pv99/run.sh            # index only, if missing; then stop
 #     bash all_genera/pv99/run.sh go         # GPU array + export, chained
 #
 #   1. index.sbatch     CPU   data/pv99_index.parquet; count is in its log
-#   2. segment.sbatch   B200  NUM_SHARDS array tasks (default 2), one GPU each
+#   2. segment.sbatch   B200  NUM_SHARDS array tasks (default 1), one GPU each
 #   3. export.sbatch    CPU   export/pv99/pv99_segment_metadata.parquet
 #
 # The first call stops after the index so the photo count can be checked before
-# GPU time is spent. TARGET=, PER_GENUS=, MIN_PV= change the index (with
-# REBUILD_INDEX=1 if one exists); NUM_SHARDS=4 ... go splits the GPU work 4 ways.
+# GPU time is spent. PER_GENUS=, MIN_PV= change the index (with
+# REBUILD_INDEX=1 if one exists); NUM_SHARDS=2 ... go splits the GPU work 2 ways.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 if [[ ! -f segment.py || ! -f all_genera/pv99/run.sh ]]; then
@@ -22,7 +22,7 @@ if [[ ! -f segment.py || ! -f all_genera/pv99/run.sh ]]; then
 fi
 mkdir -p logs
 INDEX=data/pv99_index.parquet
-NUM_SHARDS="${NUM_SHARDS:-2}"
+NUM_SHARDS="${NUM_SHARDS:-1}"
 
 if [[ "${1:-}" != "go" ]]; then
     if [[ -f "$INDEX" && -z "${REBUILD_INDEX:-}" ]]; then
@@ -31,7 +31,7 @@ if [[ "${1:-}" != "go" ]]; then
     else
         index=$(sbatch --parsable all_genera/pv99/index.sbatch)
         echo "1. index   : job $index"
-        echo "count      : tail -n 5 logs/sam3_pv99_index-$index.out   (when it finishes)"
+        echo "count      : tail -n 4 logs/sam3_pv99_index-$index.out   (when it finishes)"
         echo "next       : bash all_genera/pv99/run.sh go"
     fi
     exit 0

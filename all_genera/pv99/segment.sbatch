@@ -7,8 +7,8 @@
 #   MIN_SCORE=0.5   SAM3's detection threshold
 #   MAX_MASKS=5     then only each photo's 5 most confident detections are kept
 #
-# NUM_SHARDS must equal the array size; run.sh keeps them in step. 1M photos at
-# ~119k photos/hour per B200 is ~8.5 GPU-hours, so 2 shards is ~4-5 h each.
+# NUM_SHARDS must equal the array size; run.sh keeps them in step. ~290k photos at
+# ~119k photos/hour on one B200 is ~2.5 h; one task is plenty.
 # A killed or timed-out task resumes by photo_id when resubmitted:
 #     NUM_SHARDS=4 sbatch --array=<task> all_genera/pv99/segment.sbatch
 # ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +17,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=14
 #SBATCH --mem=240gb
-#SBATCH --time=1-00:00:00
+#SBATCH --time=12:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --requeue

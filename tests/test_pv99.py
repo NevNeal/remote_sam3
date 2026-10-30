@@ -87,19 +87,14 @@ def test_export_metadata(world, monkeypatch):
     assert not (out / "overlays").exists() and not (out / "segments").exists()
 
 
-def test_pick_floor_then_fill():
+
+def test_pick_random_per_genus():
     photos = pd.DataFrame({
         "photo_id": range(130),
         "genus": ["Big"] * 100 + ["Mid"] * 20 + ["Tiny"] * 10,
     })
-    chosen = pv99_index.pick(photos, target=60, per_genus=15, seed=0)
-    assert len(chosen) == 60
-    per = chosen.groupby("genus").size()
-    assert per["Mid"] >= 15 and per["Big"] >= 15 and per["Tiny"] == 10
-    assert (chosen.pv_pick == "floor").sum() == 40
+    chosen = pv99_index.pick(photos, per_genus=15, seed=0)
+    assert chosen.groupby("genus").size().to_dict() == {"Big": 15, "Mid": 15, "Tiny": 10}
     assert chosen.photo_id.is_unique and chosen.photo_id.is_monotonic_increasing
-    # The floor alone is over target: keep it whole, no fill.
-    over = pv99_index.pick(photos, target=20, per_genus=15, seed=0)
-    assert len(over) == 40 and set(over.pv_pick) == {"floor"}
-    # target 0: everything.
-    assert len(pv99_index.pick(photos, target=0, per_genus=15, seed=0)) == 130
+    assert chosen.photo_id.tolist() == pv99_index.pick(photos, 15, 0).photo_id.tolist()
+    assert chosen.photo_id.tolist() != pv99_index.pick(photos, 15, 1).photo_id.tolist()
