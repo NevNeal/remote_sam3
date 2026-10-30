@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-The pv99 run's index: every flower-detected angiosperm photo that phenovision
-scored at prediction_probability >= --min-probability (0.99), with no per-genus
-cap.
+The pv99 run's index: --target (1,000,000) flower-detected angiosperm photos
+that phenovision scored at prediction_probability >= --min-probability (0.99),
+with at least --per-genus (50) from every genus that has that many.
 
     python all_genera/pv99/build_index.py \\
         --annotations $SHARE/r.dinnage/.../annotations_internal_all_..._2026-03-15.csv \\
@@ -13,10 +13,16 @@ Steps 1-3 are run 1's (build_genus_index.py): angiosperm genera from the iNat
 taxa dump, the annotation rows with trait 'flower present' + predictionClass
 'Detected' (one per photo, the most probable), and the photo_id -> file listing,
 cached and reused. Step 4 keeps the photos at or above the probability cut that
-have a file on disk.
+have a file on disk, shuffles them once (--seed), and picks:
+
+    floor   the first --per-genus of each genus (all of them, if it has fewer)
+    fill    a random draw from everything left, up to --target in total
+
+so the fill follows how common each genus is. If the floor alone exceeds
+--target, it is kept whole and there is no fill. --target 0 keeps every photo.
 
 Writes the index (segment.py's --local-index columns, plus genus, family,
-observation_uuid, prediction_probability, certainty) and <out stem>_genera.csv:
+observation_uuid, prediction_probability, certainty, pv_pick) and <out stem>_genera.csv:
 one row per genus with how many photos it had at each step. The last lines of
 the log are the photo count the GPU job will see.
 """
@@ -45,6 +51,11 @@ def main():
     parser.add_argument("--path-cache", default="data/image_paths_all.parquet",
                         help="photo_id -> file listing; built if missing")
     parser.add_argument("--min-probability", type=float, default=0.99)
+    parser.add_argument("--target", type=int, default=1_000_000,
+                        help="Photos in the index; 0 = every eligible photo")
+    parser.add_argument("--per-genus", type=int, default=50,
+                        help="Photos guaranteed per genus, where it has them")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out", required=True, help="Output parquet")
     parser.add_argument("--chunksize", type=int, default=2_000_000)
     args = parser.parse_args()
@@ -68,12 +79,13 @@ def main():
 
     paths = image_paths(Path(args.path_cache), Path(args.image_root).expanduser(),
                         args.images_subdir)
-    chosen = sure.merge(paths, on="photo_id", how="inner")
-    chosen = chosen.sort_values("photo_id").reset_index(drop=True)
+    eligible = sure.merge(paths, on="photo_id", how="inner")
+    print(f"images     : {len(eligible):,} of those have a file on disk")
+    chosen = pick(eligible, args.target, args.per_genus, args.seed)
     chosen["taxon_id"] = chosen["genus"].map(genera).fillna(0).astype("int64")
     index = chosen[["photo_id", "taxon_id", "scientific_name", "reproductive_condition",
                     "file_name", "genus", "family", "observation_uuid",
-                    "prediction_probability", "certainty"]]
+                    "prediction_probability", "certainty", "pv_pick"]]
     index.to_parquet(out, index=False)
 
     by = kept.groupby("genus")
@@ -81,15 +93,35 @@ def main():
         "family": by["family"].first(),
         "flower_detected": by.size(),
         "at_min_probability": sure.groupby("genus").size(),
+        "on_disk": eligible.groupby("genus").size(),
         "selected": chosen.groupby("genus").size(),
-    }).fillna(0).astype({"at_min_probability": int, "selected": int})
+    }).fillna(0).astype({"at_min_probability": int, "on_disk": int, "selected": int})
     summary.insert(1, "taxon_id", summary.index.map(genera).fillna(0).astype("int64"))
     summary_path = out.with_name(out.stem + "_genera.csv")
     summary.rename_axis("genus").reset_index().to_csv(summary_path, index=False)
 
-    print(f"images     : {len(chosen):,} of those have a file on disk")
-    print(f"index      : {len(index):,} photos in {index['genus'].nunique():,} genera -> {out}")
+    per = chosen.groupby("genus").size()
+    picks = chosen["pv_pick"].value_counts()
+    print(f"index      : {len(index):,} photos in {len(per):,} genera -> {out}")
+    print(f"           : floor {picks.get('floor', 0):,} + fill {picks.get('fill', 0):,}; "
+          f"{(per >= args.per_genus).sum():,} genera have {args.per_genus}+, "
+          f"{(per < args.per_genus).sum():,} have fewer (all they had)")
     print(f"           : per-genus counts -> {summary_path}")
+
+
+def pick(photos, target, per_genus, seed):
+    """At least per_genus photos of each genus, then a random fill up to target,
+    with pv_pick = 'floor' or 'fill'. Sorted by photo_id."""
+    shuffled = photos.sample(frac=1, random_state=seed)
+    if target <= 0 or target >= len(shuffled):
+        chosen = shuffled.assign(pv_pick="fill")
+    else:
+        first = shuffled.groupby("genus", sort=False).cumcount() < per_genus
+        floor = shuffled[first].assign(pv_pick="floor")
+        rest = shuffled[~first]
+        fill = rest.head(max(0, target - len(floor))).assign(pv_pick="fill")
+        chosen = pd.concat([floor, fill])
+    return chosen.sort_values("photo_id").reset_index(drop=True)
 
 
 if __name__ == "__main__":

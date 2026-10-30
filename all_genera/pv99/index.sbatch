@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# The pv99 run's index: every flower-detected angiosperm photo phenovision
-# scored at >= MIN_PV (0.99). CPU only. See build_index.py next to this file.
+# The pv99 run's index: TARGET (1,000,000) flower-detected angiosperm photos
+# phenovision scored at >= MIN_PV (0.99), at least PER_GENUS (50) per genus. CPU only. See build_index.py next to this file.
 # Reuses run 1's cached data/taxa.csv.gz and data/image_paths_all.parquet.
 # The photo count is the last lines of the log.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -29,4 +29,7 @@ python all_genera/pv99/build_index.py \
     --taxa            "${PROJECT}/data/taxa.csv.gz" \
     --path-cache      "${PROJECT}/data/image_paths_all.parquet" \
     --min-probability "${MIN_PV:-0.99}" \
+    --target          "${TARGET:-1000000}" \
+    --per-genus       "${PER_GENUS:-50}" \
+    --seed            "${SEED:-0}" \
     --out             "${PROJECT}/data/pv99_index.parquet"
