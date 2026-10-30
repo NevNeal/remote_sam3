@@ -458,7 +458,8 @@ def main():
 
     # interactive map
     import plotly.graph_objects as go
-    pts = photo.sort_values("rbs")
+    # North America only: points far outside the clipped conic view leave plotly's geo blank
+    pts = na.sort_values("rbs")
     hover = ("photo %{customdata[0]}<br>RBS %{customdata[1]:.1%}<br>"
              "%{customdata[2]} segment(s)<extra></extra>")
     figi = go.Figure()
@@ -473,9 +474,12 @@ def main():
         figi.add_trace(go.Scattergeo(lon=d.longitude, lat=d.latitude, mode="markers", name=name,
                                      marker=marker, customdata=d[["photo_id", "rbs", "segments"]],
                                      hovertemplate=hover))
-    figi.update_geos(scope="north america", showland=True, landcolor=LAND, showlakes=True,
-                     lakecolor=WATER, showsubunits=True, subunitcolor=LINES,
-                     countrycolor=INK2, lataxis_range=[18, 60], lonaxis_range=[-130, -55])
+    figi.update_geos(scope="north america", projection_type="conic conformal",
+                     projection_parallels=[33, 45], projection_rotation=dict(lon=-96),
+                     lataxis_range=[18, 58], lonaxis_range=[-128, -60],
+                     showland=True, landcolor=LAND, showlakes=True, lakecolor=WATER,
+                     showocean=True, oceancolor=WATER, showsubunits=True, subunitcolor=LINES,
+                     countrycolor=INK2, coastlinecolor=INK2)
     figi.update_layout(title="R. hirta relative bullseye size (hover a point; photos open at "
                              "inaturalist.org/photos/&lt;id&gt;)", paper_bgcolor=SURFACE,
                        height=800, legend=dict(orientation="h", y=-0.02))
