@@ -179,7 +179,9 @@ def main():
     jobs = [(project, out_dir, r) for r in chosen.to_dict("records")]
     with ProcessPoolExecutor(args.workers) as ex:
         got = pd.DataFrame(list(ex.map(extract, jobs, chunksize=16)))
-    table = chosen.merge(got, on="photo_id")
+    # The metadata has its own `error` column (segment.py's); keep extract()'s.
+    table = chosen.drop(columns=["error"], errors="ignore").merge(got, on="photo_id")
+    table["error"] = table["error"].fillna("")
     bad = table[table["error"] != ""]
     table = table[table["error"] == ""]
     cols = ["family", "family_rank", "family_photos", "seg_rank", "photo_id", "genus",
