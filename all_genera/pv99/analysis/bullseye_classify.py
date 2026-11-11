@@ -149,7 +149,33 @@ def load_model(name):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"   # cpu: local smoke tests only
     model = AutoModelForImageTextToText.from_pretrained(
         name, dtype=torch.bfloat16, attn_implementation="sdpa", device_map=device).eval()
+    print(f"[bullseye] patch embeds as matmul: {linear_patch_embed(model)}", flush=True)
     return processor, model
+
+
+def linear_patch_embed(model):
+    """Swap the vision tower's Conv3d patch embedding for the equivalent matmul.
+
+    Its kernel equals its stride, so the convolution is exactly one linear map
+    per flattened patch. bf16 Conv3d through cuDNN is pathologically slow on
+    some torch/cuDNN builds (the first pv99 test sat inside it for 30 min at
+    100% CPU); a matmul avoids cuDNN entirely. Returns how many were swapped."""
+    import types
+
+    def forward(self, hidden_states):
+        w = self.proj.weight
+        x = hidden_states.to(w.dtype).reshape(-1, w[0].numel())
+        out = x @ w.reshape(w.shape[0], -1).T
+        if self.proj.bias is not None:
+            out = out + self.proj.bias
+        return out.view(-1, self.embed_dim)
+
+    n = 0
+    for module in model.modules():
+        if type(module).__name__.endswith("VisionPatchEmbed") and hasattr(module, "proj"):
+            module.forward = types.MethodType(forward, module)
+            n += 1
+    return n
 
 
 def main():
