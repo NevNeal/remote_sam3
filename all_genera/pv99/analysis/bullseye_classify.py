@@ -198,7 +198,8 @@ def main():
                         persistent_workers=bool(args.workers))
     cols = out_columns()
     header = not out.exists()
-    start, n_done, n_err, buffer = time.time(), 0, 0, []
+    start, n_done, n_err, n_batches, buffer = time.time(), 0, 0, 0, []
+    print(f"[bullseye] {time.strftime('%H:%M:%S')} model ready, starting", flush=True)
     for batch, inputs in loader:
         results = {}
         if inputs is not None:
@@ -227,6 +228,11 @@ def main():
             n_err += bool(rec["error"])
             buffer.append(rec)
         n_done += len(batch)
+        n_batches += 1
+        if n_batches <= 5 or n_batches % 25 == 0:
+            rate = n_done / (time.time() - start)
+            print(f"[bullseye] {time.strftime('%H:%M:%S')} batch {n_batches}: {n_done:,}/{len(todo):,}"
+                  f" | {rate:.1f} photos/s since first batch requested", flush=True)
         if len(buffer) >= 2000 or n_done == len(todo):
             pd.DataFrame(buffer, columns=cols).to_csv(out, mode="a", header=header, index=False)
             header, buffer = False, []
