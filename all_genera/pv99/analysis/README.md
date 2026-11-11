@@ -35,3 +35,20 @@ bash all_genera/pv99/analysis/run.sh
 
 `SKIP_PREP=1 bash all_genera/pv99/analysis/run.sh` reruns only the GPU half.
 `morph.sbatch` resumes from `photos.csv` if it is cut short.
+
+## Bullseye pattern
+
+Which genera and families have a visible bullseye (a target-like face, as in
+black-eyed Susan)? One zero-shot Qwen3-VL-8B question (`bullseye_question.py`)
+over the context crop of the top segment of **every** masked pv99 photo
+(~270k), not just the 3,000 top segments above.
+
+```bash
+bash all_genera/pv99/analysis/bullseye_run.sh test   # 200 photos, prints photos/s
+bash all_genera/pv99/analysis/bullseye_run.sh        # 4 B200 shards + report
+```
+
+Outputs in `export/pv99/analysis/bullseye/`: `photos.csv`, `genus_bullseye.csv`,
+`family_bullseye.csv` (empirical-Bayes beta-binomial ranking with 90% credible
+intervals), `controls.csv`, `top_genera.png`, `top_families.png` and contact
+sheets under `sheets/` for checking precision by eye.
